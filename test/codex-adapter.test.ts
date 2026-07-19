@@ -35,11 +35,15 @@ const output = (value) => writeSync(1, JSON.stringify(value) + '\\n');
 const prompt = readFileSync(0, 'utf8');
 writeFileSync(${JSON.stringify(capture)}, JSON.stringify({ args: process.argv.slice(2), prompt, env: process.env }));
 output({type:'thread.started', thread_id:'thread-test'});
-output({type:'item.completed',item:{type:'command_execution',command:'fake command',exit_code:0}});
+output({type:'item.completed',item:{type:'agent_message',text:'Fake intermediate response'}});
+output({type:'item.completed',item:{type:'command_execution',command:'fake command',exit_code:2,status:'failed'}});
 if (prompt.includes('INVALID_JSON')) writeSync(1, '{bad json\\n');
 if (prompt.includes('CHANGE_FILES')) for (const line of prompt.split('\\n')) if (/^- .*: \\/.*/.test(line)) appendFileSync(line.replace(/^- .*: /, '') + '/README.md', 'changed\\n');
 if (prompt.includes('WAIT_FOREVER')) await new Promise((resolve) => setInterval(resolve, 60_000));
 if (prompt.includes('EXIT_NONZERO')) process.exit(7);
+if (prompt.includes('EXIT_ZERO_INCOMPLETE')) process.exit(0);
+if (prompt.includes('TURN_FAILED')) { output({type:'turn.failed',error:{message:'model turn failed'}}); process.exit(0); }
+if (prompt.includes('ERROR_EVENT')) { output({type:'error',message:'stream protocol error'}); process.exit(0); }
 output({type:'item.completed',item:{type:'file_change',path:'README.md'}});
 output({type:'item.completed',item:{type:'agent_message',text:'Fake final response'}});
 output({type:'turn.completed',usage:{input_tokens:12,output_tokens:4}});
@@ -75,8 +79,11 @@ test('single-repository Codex execution uses safe CLI arguments and parses JSONL
   const { app, store, project, capture, root } = await fixture(); const job = await createJob(app, project, 'Do the work');
   assert.equal((await terminal(store, job.id)).status, 'done');
   const events = store.events(job.id); assert.equal(events.find((event: any) => event.type === 'session')?.data.threadId, 'thread-test');
+  assert.equal(events.filter((event: any) => event.type === 'progress' && event.message.includes('Fake')).length, 2);
   assert.equal(events.find((event: any) => event.type === 'final_response')?.message, 'Fake final response');
-  assert.deepEqual(events.find((event: any) => event.type === 'usage')?.data, { input_tokens: 12, output_tokens: 4 });
+  assert.equal(events.filter((event: any) => event.type === 'final_response').length, 1);
+  assert.deepEqual(events.find((event: any) => event.type === 'token_usage')?.data, { input_tokens: 12, output_tokens: 4 });
+  assert.equal(events.find((event: any) => event.type === 'command')?.data.exit_code, 2);
   const captured = JSON.parse(readFileSync(capture, 'utf8'));
   assert.deepEqual(captured.args.slice(0, 7), ['exec', '--json', '--ephemeral', '--sandbox', 'workspace-write', '--skip-git-repo-check', '-c']);
   assert.ok(captured.prompt.includes(join(root, 'runs', job.id))); assert.ok(!('OPENAI_API_KEY' in captured.env));
@@ -112,6 +119,29 @@ test('nonzero Codex exit clearly fails the job', async () => {
   assert.equal((await terminal(store, job.id)).status, 'failed'); assert.match((store.events(job.id).at(-1)?.data as any).error, /code 7/);
 });
 
+test('zero exit without turn.completed fails with protocol_incomplete and has no results', async () => {
+  const { app, store, project } = await fixture(); const job = await createJob(app, project, 'EXIT_ZERO_INCOMPLETE');
+  assert.equal((await terminal(store, job.id)).status, 'failed');
+  const events = store.events(job.id);
+  assert.match((events.at(-1)?.data as any).error, /protocol_incomplete/);
+  assert.equal(events.some((event: any) => event.type === 'final_response'), false);
+  assert.equal(events.some((event: any) => event.type === 'repository_result'), false);
+});
+
+test('turn.failed fails the job even when the child exits zero', async () => {
+  const { app, store, project } = await fixture(); const job = await createJob(app, project, 'TURN_FAILED');
+  assert.equal((await terminal(store, job.id)).status, 'failed');
+  const events = store.events(job.id);
+  assert.ok(events.some((event: any) => event.type === 'error' && event.message === 'model turn failed'));
+  assert.equal(events.some((event: any) => event.type === 'repository_result'), false);
+});
+
+test('error JSONL event fails the job even when the child exits zero', async () => {
+  const { app, store, project } = await fixture(); const job = await createJob(app, project, 'ERROR_EVENT');
+  assert.equal((await terminal(store, job.id)).status, 'failed');
+  assert.ok(store.events(job.id).some((event: any) => event.type === 'error' && event.message === 'stream protocol error'));
+});
+
 test('repository paths are revalidated at execution and non-git paths fail', async () => {
   const { app, store, project, root } = await fixture();
   const nongit = join(root, 'nongit'); mkdirSync(nongit);
@@ -132,5 +162,8 @@ test('JSONL event translation covers commands, file changes, errors and usage', 
   assert.equal(translateCodexEvent({ type: 'item.completed', item: { type: 'command_execution', command: 'npm test' } })?.type, 'command');
   assert.equal(translateCodexEvent({ type: 'item.completed', item: { type: 'file_change', path: 'x.ts' } })?.type, 'file_change');
   assert.equal(translateCodexEvent({ type: 'error', message: 'bad' })?.type, 'error');
-  assert.equal(translateCodexEvent({ type: 'turn.completed', usage: { input_tokens: 1 } })?.type, 'usage');
+  assert.equal(translateCodexEvent({ type: 'turn.completed', usage: { input_tokens: 1 } }).type, 'token_usage');
+  const unknown = translateCodexEvent({ type: 'future.event', secret: 'do-not-store', item: { id: 'safe-id', type: 'future-item', text: 'secret' } });
+  assert.equal(unknown.type, 'diagnostic');
+  assert.deepEqual(unknown.data, { eventType: 'future.event', itemType: 'future-item', itemId: 'safe-id', status: undefined });
 });

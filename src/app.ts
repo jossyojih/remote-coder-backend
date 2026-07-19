@@ -52,6 +52,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       workspaceRoot,
       timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
+      log: app.log,
     }),
   }, app.log);
 
