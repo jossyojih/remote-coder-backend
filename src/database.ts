@@ -1,0 +1,139 @@
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import type { Job, JobEvent, JobStatus, Project, Repository } from './types.js';
+
+type ProjectRow = { id: string; name: string; created_at: string };
+type RepoRow = { id: string; project_id: string; name: string; path: string; created_at: string };
+type JobRow = { id: string; project_id: string; prompt: string; status: JobStatus; created_at: string; updated_at: string };
+type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
+
+export class Store {
+  readonly db: DatabaseSync;
+
+  constructor(path: string) {
+    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
+    this.db = new DatabaseSync(path);
+    this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS repositories (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(project_id, path)
+      );
+      CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        prompt TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','running','needs_input','failed','done','cancelled')),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS job_repositories (
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        repository_id TEXT NOT NULL REFERENCES repositories(id), PRIMARY KEY(job_id, repository_id)
+      );
+      CREATE TABLE IF NOT EXISTS job_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        type TEXT NOT NULL, message TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at);
+      CREATE INDEX IF NOT EXISTS events_job_id ON job_events(job_id, id);
+    `);
+    // A process that died mid-job leaves work recoverable.
+    this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
+  }
+
+  close() { this.db.close(); }
+
+  createProject(name: string, repositories: Array<{ name: string; path: string }>): Project {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT INTO projects VALUES (?, ?, ?)').run(id, name, now);
+      const insert = this.db.prepare('INSERT INTO repositories VALUES (?, ?, ?, ?, ?)');
+      for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    return this.getProject(id)!;
+  }
+
+  listProjects(): Project[] {
+    const rows = this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as unknown as ProjectRow[];
+    return rows.map((row) => this.mapProject(row));
+  }
+
+  getProject(id: string): Project | undefined {
+    const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as unknown as ProjectRow | undefined;
+    return row ? this.mapProject(row) : undefined;
+  }
+
+  private mapProject(row: ProjectRow): Project {
+    const repos = this.db.prepare('SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, name').all(row.id) as unknown as RepoRow[];
+    return { id: row.id, name: row.name, createdAt: row.created_at, repositories: repos.map(this.mapRepo) };
+  }
+
+  private mapRepo = (row: RepoRow): Repository => ({ id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at });
+
+  repositoriesBelongTo(projectId: string, ids: string[]): boolean {
+    const placeholders = ids.map(() => '?').join(',');
+    if (!placeholders) return false;
+    const row = this.db.prepare(`SELECT COUNT(*) count FROM repositories WHERE project_id = ? AND id IN (${placeholders})`).get(projectId, ...ids) as { count: number };
+    return Number(row.count) === ids.length;
+  }
+
+  createJob(projectId: string, prompt: string, repositoryIds: string[]): Job {
+    const id = crypto.randomUUID(); const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)').run(id, projectId, prompt, 'queued', now, now);
+      const insert = this.db.prepare('INSERT INTO job_repositories VALUES (?, ?)');
+      for (const repositoryId of repositoryIds) insert.run(id, repositoryId);
+      this.addEvent(id, 'status', 'Job queued', { status: 'queued' });
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    return this.getJob(id)!;
+  }
+
+  getJob(id: string): Job | undefined {
+    const row = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as unknown as JobRow | undefined;
+    return row ? this.mapJob(row) : undefined;
+  }
+
+  listJobs(projectId?: string): Job[] {
+    const rows = (projectId
+      ? this.db.prepare('SELECT * FROM jobs WHERE project_id = ? ORDER BY created_at DESC').all(projectId)
+      : this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC').all()) as unknown as JobRow[];
+    return rows.map((row) => this.mapJob(row));
+  }
+
+  private mapJob(row: JobRow): Job {
+    const selected = this.db.prepare('SELECT repository_id FROM job_repositories WHERE job_id = ? ORDER BY rowid').all(row.id) as unknown as Array<{ repository_id: string }>;
+    return { id: row.id, projectId: row.project_id, prompt: row.prompt, status: row.status, selectedRepositoryIds: selected.map((x) => x.repository_id), createdAt: row.created_at, updatedAt: row.updated_at };
+  }
+
+  nextQueuedJob(): Job | undefined {
+    const row = this.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1").get() as unknown as JobRow | undefined;
+    return row ? this.mapJob(row) : undefined;
+  }
+
+  setStatus(id: string, status: JobStatus): boolean {
+    const result = this.db.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?').run(status, new Date().toISOString(), id);
+    return Number(result.changes) > 0;
+  }
+
+  claim(id: string): boolean {
+    const result = this.db.prepare("UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'queued'").run(new Date().toISOString(), id);
+    return Number(result.changes) === 1;
+  }
+
+  addEvent(jobId: string, type: string, message: string, data: unknown = {}): JobEvent {
+    const createdAt = new Date().toISOString();
+    const result = this.db.prepare('INSERT INTO job_events(job_id,type,message,data,created_at) VALUES(?,?,?,?,?)').run(jobId, type, message, JSON.stringify(data), createdAt);
+    return { id: Number(result.lastInsertRowid), jobId, type, message, data, createdAt };
+  }
+
+  events(id: string, after = 0): JobEvent[] {
+    const rows = this.db.prepare('SELECT * FROM job_events WHERE job_id = ? AND id > ? ORDER BY id').all(id, after) as unknown as EventRow[];
+    return rows.map((row) => ({ id: row.id, jobId: row.job_id, type: row.type, message: row.message, data: JSON.parse(row.data), createdAt: row.created_at }));
+  }
+}
