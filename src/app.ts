@@ -4,6 +4,7 @@ import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { ZodError } from 'zod';
 import { Store } from './database.js';
+import { CodexAgentAdapter } from './codex-adapter.js';
 import { createJobSchema, createProjectSchema, idParamsSchema, replySchema } from './schemas.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 
@@ -14,6 +15,10 @@ export interface AppOptions {
   frontendOrigin?: string;
   logger?: boolean;
   mockStepDelayMs?: number;
+  codexBin?: string;
+  runsRoot?: string;
+  jobTimeoutMs?: number;
+  jobKillGraceMs?: number;
 }
 
 export interface CommandCenterApp {
@@ -39,7 +44,16 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const workspaceRoot = options.workspaceRoot ?? process.env.WORKSPACE_ROOT ?? process.cwd();
   const store = new Store(options.databasePath ?? process.env.DATABASE_PATH ?? './data/command-center.sqlite');
   const bus = new JobEventBus();
-  const worker = new JobWorker(store, bus, new MockAgentAdapter(options.mockStepDelayMs), app.log);
+  const worker = new JobWorker(store, bus, {
+    mock: new MockAgentAdapter(options.mockStepDelayMs),
+    codex: new CodexAgentAdapter({
+      codexBin: options.codexBin ?? process.env.CODEX_BIN ?? 'codex',
+      runsRoot: options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs',
+      workspaceRoot,
+      timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),
+      killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
+    }),
+  }, app.log);
 
   await app.register(cors, { origin: options.frontendOrigin ?? process.env.FRONTEND_ORIGIN ?? false });
   app.addHook('onRequest', async (request, reply) => {
@@ -73,7 +87,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const input = createJobSchema.parse(request.body);
     if (!store.getProject(input.projectId)) return reply.code(404).send({ error: 'Project not found' });
     if (!store.repositoriesBelongTo(input.projectId, input.selectedRepositoryIds)) return reply.code(400).send({ error: 'Every selected repository must belong to the project' });
-    const job = store.createJob(input.projectId, input.prompt, input.selectedRepositoryIds); worker.wake();
+    const job = store.createJob(input.projectId, input.prompt, input.selectedRepositoryIds, input.agent); worker.wake();
     return reply.code(201).send(job);
   });
   app.get('/jobs', async (request) => {

@@ -23,10 +23,17 @@ export interface Job {
   id: string;
   projectId: string;
   prompt: string;
+  agent: 'mock' | 'codex';
   status: JobStatus;
   selectedRepositoryIds: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export type AgentEventEmitter = (type: string, message: string, data?: unknown) => void;
+
+export interface AgentAdapter {
+  run(job: Job, repositories: Repository[], emit: AgentEventEmitter, signal: AbortSignal): Promise<void>;
 }
 
 export interface JobEvent {

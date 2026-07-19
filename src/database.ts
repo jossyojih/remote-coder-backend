@@ -5,7 +5,7 @@ import type { Job, JobEvent, JobStatus, Project, Repository } from './types.js';
 
 type ProjectRow = { id: string; name: string; created_at: string };
 type RepoRow = { id: string; project_id: string; name: string; path: string; created_at: string };
-type JobRow = { id: string; project_id: string; prompt: string; status: JobStatus; created_at: string; updated_at: string };
+type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex'; status: JobStatus; created_at: string; updated_at: string };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
 export class Store {
@@ -38,6 +38,10 @@ export class Store {
       CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS events_job_id ON job_events(job_id, id);
     `);
+    const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>;
+    if (!jobColumns.some((column) => column.name === 'agent')) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'mock' CHECK(agent IN ('mock','codex'))");
+    }
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
   }
@@ -81,11 +85,19 @@ export class Store {
     return Number(row.count) === ids.length;
   }
 
-  createJob(projectId: string, prompt: string, repositoryIds: string[]): Job {
+  repositories(ids: string[]): Repository[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.db.prepare(`SELECT * FROM repositories WHERE id IN (${placeholders})`).all(...ids) as unknown as RepoRow[];
+    const byId = new Map(rows.map((row) => [row.id, this.mapRepo(row)]));
+    return ids.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
+  }
+
+  createJob(projectId: string, prompt: string, repositoryIds: string[], agent: 'mock' | 'codex' = 'mock'): Job {
     const id = crypto.randomUUID(); const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)').run(id, projectId, prompt, 'queued', now, now);
+      this.db.prepare('INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, projectId, prompt, 'queued', now, now, agent);
       const insert = this.db.prepare('INSERT INTO job_repositories VALUES (?, ?)');
       for (const repositoryId of repositoryIds) insert.run(id, repositoryId);
       this.addEvent(id, 'status', 'Job queued', { status: 'queued' });
@@ -108,7 +120,7 @@ export class Store {
 
   private mapJob(row: JobRow): Job {
     const selected = this.db.prepare('SELECT repository_id FROM job_repositories WHERE job_id = ? ORDER BY rowid').all(row.id) as unknown as Array<{ repository_id: string }>;
-    return { id: row.id, projectId: row.project_id, prompt: row.prompt, status: row.status, selectedRepositoryIds: selected.map((x) => x.repository_id), createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, projectId: row.project_id, prompt: row.prompt, agent: row.agent ?? 'mock', status: row.status, selectedRepositoryIds: selected.map((x) => x.repository_id), createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   nextQueuedJob(): Job | undefined {
