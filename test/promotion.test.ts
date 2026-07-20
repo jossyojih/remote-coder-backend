@@ -19,16 +19,17 @@ async function gitRepository(root: string, name: string) {
   return { remote, source, initial: (await runCommand('git', ['rev-parse', 'HEAD'], source)).stdout.trim() };
 }
 
-async function setup(count = 1) {
+async function setup(count = 1, deployIndex?: number) {
   const root = mkdtempSync(join(tmpdir(), 'promotion-')); const runsRoot = join(root, 'runs'); mkdirSync(runsRoot);
   const repositories = []; for (let i = 0; i < count; i++) repositories.push(await gitRepository(root, `repo-${i + 1}`));
-  const built = await buildApp({ databasePath: join(root, 'db.sqlite'), workspaceRoot: root, runsRoot, apiToken: token, mockStepDelayMs: 10_000 }); apps.push(built.app);
+  const starts: string[] = [];
+  const built = await buildApp({ databasePath: join(root, 'db.sqlite'), workspaceRoot: root, runsRoot, apiToken: token, deploymentApiToken: 'deploy-token', backendDeployRepositoryPath: deployIndex === undefined ? undefined : repositories[deployIndex]!.source, deploymentStarter: async (id) => { starts.push(id); }, mockStepDelayMs: 10_000 }); apps.push(built.app);
   const project = (await built.app.inject({ method: 'POST', url: '/projects', headers: auth, payload: { name: 'Project', repositories: repositories.map((r, i) => ({ name: `Repo ${i + 1}`, path: r.source })) } })).json();
   const created = (await built.app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: project.id, prompt: 'fake agent changes', selectedRepositoryIds: project.repositories.map((r: { id: string }) => r.id), agent: 'mock' } })).json();
   await built.app.inject({ method: 'POST', url: `/jobs/${created.id}/cancel`, headers: auth });
   built.store.resolveScope(created.id, project.repositories.map((r: { id: string }) => r.id), []);
   const prepared = (await prepareRepositories(built.store.getJob(created.id)!, built.store.repositories(project.repositories.map((r: { id: string }) => r.id)), root, runsRoot, (_type, _message, data) => built.store.recordRepositoryRun({ jobId: created.id, ...(data as Omit<import('../src/types.js').JobRepositoryRun, 'jobId'>) }))).prepared;
-  built.store.setStatus(created.id, 'done'); return { ...built, root, runsRoot, repositories, project, jobId: created.id, prepared };
+  built.store.setStatus(created.id, 'done'); return { ...built, root, runsRoot, repositories, project, jobId: created.id, prepared, starts };
 }
 
 test('worktrees use the latest remote commit and review returns bounded file diffs', async () => {
@@ -44,6 +45,28 @@ test('promotes safely, returns commit metadata, and is idempotent', async () => 
   const first = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(first.statusCode, 200, first.body);
   const result = first.json(); assert.equal(result.status, 'promoted'); assert.match(result.repositories[0].commitSha, /^[a-f0-9]{40}$/); assert.equal(result.repositories[0].targetBranch, 'main');
   const second = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(second.statusCode, 200); assert.equal(second.json().repositories[0].commitSha, result.repositories[0].commitSha);
+});
+
+test('queues one exact-commit backend deployment and exposes only sanitized authenticated status', async () => {
+  const f = await setup(2, 0); for (const repo of f.prepared) appendFileSync(join(repo.worktreePath, 'README.md'), 'approved\n');
+  const payload = { commitMessage: 'Approved change', approvedRepositoryIds: f.project.repositories.map((r: { id: string }) => r.id) };
+  const promoted = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(promoted.statusCode, 200, promoted.body);
+  assert.equal(f.starts.length, 1);
+  const backendCommit = promoted.json().repositories.find((r: { repositoryId: string }) => r.repositoryId === f.project.repositories[0].id).commitSha;
+  const status = await f.app.inject({ url: `/jobs/${f.jobId}/deployments`, headers: auth }); assert.equal(status.statusCode, 200);
+  assert.equal(status.json().length, 1); assert.equal(status.json()[0].commitSha, backendCommit); assert.equal(status.json()[0].status, 'queued');
+  assert.equal('sourcePath' in status.json()[0], false); assert.equal((await f.app.inject({ url: `/jobs/${f.jobId}/deployments` })).statusCode, 401);
+  const claim = await f.app.inject({ method: 'POST', url: `/internal/deployments/${f.starts[0]}/claim`, headers: { authorization: 'Bearer deploy-token' } });
+  assert.equal(claim.statusCode, 200); assert.equal(claim.json().commitSha, backendCommit); assert.equal(claim.json().sourcePath, f.repositories[0].source);
+  assert.equal((await f.app.inject({ method: 'POST', url: `/internal/deployments/${f.starts[0]}/claim`, headers: { authorization: 'Bearer deploy-token' } })).statusCode, 409);
+  const done = await f.app.inject({ method: 'POST', url: `/internal/deployments/${f.starts[0]}/state`, headers: { authorization: 'Bearer deploy-token' }, payload: { status: 'succeeded', stage: 'healthy' } }); assert.equal(done.statusCode, 200);
+  await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(f.starts.length, 1);
+});
+
+test('frontend-only promotion does not queue an EC2 deployment', async () => {
+  const f = await setup(2, 0); appendFileSync(join(f.prepared[1].worktreePath, 'README.md'), 'frontend\n');
+  const response = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'Frontend only', approvedRepositoryIds: [f.project.repositories[1].id] } });
+  assert.equal(response.statusCode, 200, response.body); assert.deepEqual(f.starts, []); assert.deepEqual(f.store.deploymentsForJob(f.jobId), []);
 });
 
 test('rejects stale remotes without pushing job changes', async () => {

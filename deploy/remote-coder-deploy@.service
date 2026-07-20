@@ -1,0 +1,22 @@
+[Unit]
+Description=Remote Coder backend deployment %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=remote-coder
+Group=remote-coder
+EnvironmentFile=/etc/remote-coder/deployment.env
+ExecStart=/usr/bin/flock -n /run/lock/remote-coder-deploy.lock /usr/local/lib/remote-coder/deploy-backend.mjs %i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/remote-coder-backend /run/lock
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

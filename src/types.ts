@@ -78,3 +78,12 @@ export interface Promotion {
   id: string; jobId: string; commitMessage: string; status: PromotionStatus;
   createdAt: string; updatedAt: string; repositories: PromotionRepositoryResult[];
 }
+export const DEPLOYMENT_STATUSES = ['queued', 'deploying', 'succeeded', 'failed', 'rolled_back'] as const;
+export type DeploymentStatus = (typeof DEPLOYMENT_STATUSES)[number];
+export interface Deployment {
+  id: string; jobId: string; promotionId: string; repositoryId: string; commitSha: string;
+  status: DeploymentStatus; stage: string; errorCode?: string; createdAt: string; updatedAt: string;
+}
+export interface DeploymentClaim extends Deployment {
+  sourcePath: string; remoteName: string; targetBranch: string;
+}

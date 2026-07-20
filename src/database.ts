@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
+import type { Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
 
 type ProjectRow = { id: string; name: string; created_at: string };
 type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; created_at: string };
@@ -59,6 +59,16 @@ export class Store {
         target_branch TEXT NOT NULL, error TEXT, conflict INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
         PRIMARY KEY(promotion_id, repository_id)
       );
+      CREATE TABLE IF NOT EXISTS deployments (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        promotion_id TEXT NOT NULL REFERENCES promotions(id) ON DELETE CASCADE,
+        repository_id TEXT NOT NULL REFERENCES repositories(id), commit_sha TEXT NOT NULL,
+        source_path TEXT NOT NULL, remote_name TEXT NOT NULL, target_branch TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('queued','deploying','succeeded','failed','rolled_back')),
+        stage TEXT NOT NULL, error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(promotion_id, repository_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS deployments_one_active ON deployments((1)) WHERE status IN ('queued','deploying');
     `);
     const repositoryColumns = this.db.prepare('PRAGMA table_info(repositories)').all() as unknown as Array<{ name: string }>;
     if (!repositoryColumns.some((column) => column.name === 'remote_name')) this.db.exec("ALTER TABLE repositories ADD COLUMN remote_name TEXT NOT NULL DEFAULT 'origin'");
@@ -357,5 +367,52 @@ export class Store {
     const states = this.db.prepare('SELECT status FROM promotion_repositories WHERE promotion_id=?').all(promotion.id) as Array<{ status: PromotionStatus }>;
     const aggregate: PromotionStatus = states.every((r) => r.status === 'promoted') ? 'promoted' : states.some((r) => r.status === 'promoting') ? 'promoting' : states.some((r) => r.status === 'failed') ? 'failed' : 'pending';
     this.db.prepare('UPDATE promotions SET status=?,updated_at=? WHERE id=?').run(aggregate, now, promotion.id);
+  }
+
+  createDeployment(jobId: string, repositoryId: string, commitSha: string, run: JobRepositoryRun): { deployment?: Deployment; conflict?: string } {
+    const promotion = this.getPromotion(jobId); if (!promotion) return { conflict: 'promotion_not_found' };
+    const existing = this.db.prepare('SELECT id FROM deployments WHERE promotion_id=? AND repository_id=?').get(promotion.id, repositoryId) as { id: string } | undefined;
+    if (existing) return { deployment: this.getDeployment(existing.id) };
+    const id = crypto.randomUUID(); const now = new Date().toISOString();
+    try {
+      this.db.prepare("INSERT INTO deployments VALUES (?,?,?,?,?,?,?,?,'queued','queued',NULL,?,?)")
+        .run(id, jobId, promotion.id, repositoryId, commitSha, run.sourcePath, run.remoteName, run.targetBranch, now, now);
+      return { deployment: this.getDeployment(id)! };
+    } catch (error) {
+      if ((error as { code?: string }).code?.startsWith('SQLITE_CONSTRAINT')) return { conflict: 'deployment_active' };
+      throw error;
+    }
+  }
+
+  private mapDeployment(row: Record<string, string | null>): Deployment {
+    return { id: row.id!, jobId: row.job_id!, promotionId: row.promotion_id!, repositoryId: row.repository_id!, commitSha: row.commit_sha!, status: row.status as DeploymentStatus, stage: row.stage!, errorCode: row.error_code ?? undefined, createdAt: row.created_at!, updatedAt: row.updated_at! };
+  }
+
+  getDeployment(id: string): Deployment | undefined {
+    const row = this.db.prepare('SELECT * FROM deployments WHERE id=?').get(id) as Record<string, string | null> | undefined;
+    return row ? this.mapDeployment(row) : undefined;
+  }
+
+  hasActiveDeployment(): boolean {
+    return Boolean(this.db.prepare("SELECT 1 present FROM deployments WHERE status IN ('queued','deploying') LIMIT 1").get());
+  }
+
+  deploymentsForJob(jobId: string): Deployment[] {
+    const rows = this.db.prepare('SELECT * FROM deployments WHERE job_id=? ORDER BY created_at,rowid').all(jobId) as Array<Record<string, string | null>>;
+    return rows.map((row) => this.mapDeployment(row));
+  }
+
+  claimDeployment(id: string): DeploymentClaim | undefined {
+    const now = new Date().toISOString();
+    const result = this.db.prepare("UPDATE deployments SET status='deploying',stage='preparing',updated_at=? WHERE id=? AND status='queued'").run(now, id);
+    if (Number(result.changes) !== 1) return undefined;
+    const row = this.db.prepare('SELECT * FROM deployments WHERE id=?').get(id) as Record<string, string | null>;
+    return { ...this.mapDeployment(row), sourcePath: row.source_path!, remoteName: row.remote_name!, targetBranch: row.target_branch! };
+  }
+
+  updateDeployment(id: string, status: DeploymentStatus, stage: string, errorCode?: string): Deployment | undefined {
+    const current = this.getDeployment(id); if (!current || !['queued', 'deploying'].includes(current.status)) return undefined;
+    this.db.prepare('UPDATE deployments SET status=?,stage=?,error_code=?,updated_at=? WHERE id=?').run(status, stage, errorCode ?? null, new Date().toISOString(), id);
+    return this.getDeployment(id);
   }
 }

@@ -10,6 +10,8 @@ import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, p
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
 import { PromotionConflictError, PromotionService } from './promotion.js';
+import { DeploymentCoordinator, systemdDeploymentStarter, type DeploymentStarter } from './deployment.js';
+import { DEPLOYMENT_STATUSES } from './types.js';
 
 export interface AppOptions {
   databasePath?: string;
@@ -32,6 +34,9 @@ export interface AppOptions {
   jobTimeoutMs?: number;
   jobKillGraceMs?: number;
   allowMockAgent?: boolean;
+  backendDeployRepositoryPath?: string;
+  deploymentApiToken?: string;
+  deploymentStarter?: DeploymentStarter;
 }
 
 export interface CommandCenterApp {
@@ -57,6 +62,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     : (options.logger ? { redact: { paths: ['req.headers.authorization', 'req.body.password', 'req.body.prompt', 'req.body.message', 'res.body.accessToken'], censor: '[REDACTED]' } } : false);
   const app = Fastify({ logger });
   const apiToken = options.apiToken ?? process.env.RUNNER_API_TOKEN;
+  const deploymentApiToken = options.deploymentApiToken ?? process.env.DEPLOYMENT_API_TOKEN;
   const appPasswordHash = options.appPasswordHash ?? process.env.APP_PASSWORD_HASH;
   const appSessionSecret = options.appSessionSecret ?? process.env.APP_SESSION_SECRET;
   const appTokenTtlSeconds = options.appTokenTtlSeconds ?? Number(process.env.APP_TOKEN_TTL_SECONDS ?? 900);
@@ -67,7 +73,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const workspaceRoot = options.workspaceRoot ?? process.env.WORKSPACE_ROOT ?? process.cwd();
   const store = new Store(options.databasePath ?? process.env.DATABASE_PATH ?? './data/command-center.sqlite');
   const runsRoot = options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs';
-  const promotion = new PromotionService(store, workspaceRoot, isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot));
+  const deploymentCoordinator = new DeploymentCoordinator(store, options.backendDeployRepositoryPath ?? process.env.BACKEND_DEPLOY_REPOSITORY_PATH, options.deploymentStarter ?? systemdDeploymentStarter());
+  const promotion = new PromotionService(store, workspaceRoot, isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot), deploymentCoordinator);
   const bus = new JobEventBus();
   const allowMockAgent = options.allowMockAgent ?? process.env.NODE_ENV === 'test';
   const worker = new JobWorker(store, bus, {
@@ -105,6 +112,10 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     if (request.url === '/health' || request.url === '/auth/login') return;
     const authorization = request.headers.authorization;
     const bearer = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+    if (request.url.startsWith('/internal/deployments/')) {
+      if (deploymentApiToken && bearer === deploymentApiToken) return;
+      return reply.code(deploymentApiToken ? 401 : 503).send({ error: deploymentApiToken ? 'Unauthorized' : 'Deployment authentication is not configured' });
+    }
     if ((apiToken && bearer === apiToken) || (appSessionSecret && bearer && verifyAccessToken(bearer, appSessionSecret, now()))) return;
     if (!apiToken && !appSessionSecret) return reply.code(503).send({ error: 'Authentication is not configured' });
     return reply.code(401).send({ error: 'Unauthorized' });
@@ -174,6 +185,26 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const { id } = idParamsSchema.parse(request.params); const input = promoteJobSchema.parse(request.body);
     const result = await promotion.promote(id, input.commitMessage, input.approvedRepositoryIds);
     return reply.code(result.status === 'promoted' ? 200 : 409).send(result);
+  });
+  app.get('/jobs/:id/deployments', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    if (!store.getJob(id)) return reply.code(404).send({ error: 'Job not found' });
+    return store.deploymentsForJob(id);
+  });
+  app.get('/deployments/:id', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const deployment = store.getDeployment(id);
+    return deployment ?? reply.code(404).send({ error: 'Deployment not found' });
+  });
+  app.post('/internal/deployments/:id/claim', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const deployment = store.claimDeployment(id);
+    return deployment ?? reply.code(409).send({ error: 'Deployment is not queued' });
+  });
+  app.post('/internal/deployments/:id/state', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const body = request.body as { status?: unknown; stage?: unknown; errorCode?: unknown } | null;
+    if (!body || !DEPLOYMENT_STATUSES.includes(body.status as never) || typeof body.stage !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(body.stage) || (body.errorCode !== undefined && (typeof body.errorCode !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(body.errorCode)))) return reply.code(400).send({ error: 'Invalid deployment state' });
+    if (body.status === 'queued') return reply.code(400).send({ error: 'A deployment cannot return to queued' });
+    return store.updateDeployment(id, body.status as typeof DEPLOYMENT_STATUSES[number], body.stage, body.errorCode as string | undefined) ?? reply.code(409).send({ error: 'Deployment is terminal or missing' });
   });
   app.get('/jobs/:id/conversation', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const conversation = store.conversation(id);

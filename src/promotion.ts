@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import type { Store } from './database.js';
 import { runCommand } from './agent-runtime.js';
 import type { JobRepositoryRun, Promotion } from './types.js';
+import type { DeploymentCoordinator } from './deployment.js';
 
 const MAX_DIFF_BYTES = 120_000;
 const MAX_FILE_DIFF_BYTES = 32_000;
@@ -32,7 +33,7 @@ function bounded(value: string, max: number): { text: string; truncated: boolean
 }
 
 export class PromotionService {
-  constructor(private readonly store: Store, private readonly workspaceRoot: string, private readonly runsRoot: string) {}
+  constructor(private readonly store: Store, private readonly workspaceRoot: string, private readonly runsRoot: string, private readonly deployments?: DeploymentCoordinator) {}
 
   private async validateRun(run: JobRepositoryRun) {
     const workspace = await realpath(this.workspaceRoot); const runs = await realpath(this.runsRoot);
@@ -86,6 +87,10 @@ export class PromotionService {
     const existingIds = existing.repositories.map((r) => r.repositoryId).sort();
     if (existingIds.join() !== [...approvedIds].sort().join()) throw new PromotionConflictError('A promotion already exists with different approved repositories', 'approval_mismatch');
     for (const run of runs) {
+      const prior = existing.repositories.find((r) => r.repositoryId === run.repositoryId)!;
+      if (prior.status !== 'promoted') await this.deployments?.assertAvailable(run);
+    }
+    for (const run of runs) {
       const prior = this.store.getPromotion(jobId)!.repositories.find((r) => r.repositoryId === run.repositoryId)!;
       if (prior.status === 'promoted') continue;
       this.store.setPromotionRepository(jobId, run.repositoryId, 'promoting');
@@ -98,7 +103,7 @@ export class PromotionService {
         if (headBefore !== run.baseCommitSha) {
           await runCommand('git', ['merge-base', '--is-ancestor', run.baseCommitSha, headBefore], run.worktreePath);
           await runCommand('git', ['push', run.remoteName, `HEAD:refs/heads/${run.targetBranch}`], run.worktreePath);
-          this.store.setPromotionRepository(jobId, run.repositoryId, 'promoted', { commitSha: headBefore }); continue;
+          this.store.setPromotionRepository(jobId, run.repositoryId, 'promoted', { commitSha: headBefore }); await this.deployments?.enqueue(jobId, run, headBefore); continue;
         }
         await runCommand('git', ['add', '-A', '--'], run.worktreePath);
         const staged = (await runCommand('git', ['diff', '--cached', '--quiet', '--exit-code'], run.worktreePath).then(() => false, (error) => {
@@ -108,7 +113,7 @@ export class PromotionService {
         await runCommand('git', ['commit', '--no-gpg-sign', '-m', message, '--'], run.worktreePath);
         const commitSha = (await runCommand('git', ['rev-parse', 'HEAD'], run.worktreePath)).stdout.trim();
         await runCommand('git', ['push', run.remoteName, `HEAD:refs/heads/${run.targetBranch}`], run.worktreePath);
-        this.store.setPromotionRepository(jobId, run.repositoryId, 'promoted', { commitSha });
+        this.store.setPromotionRepository(jobId, run.repositoryId, 'promoted', { commitSha }); await this.deployments?.enqueue(jobId, run, commitSha);
       } catch (error) {
         const conflict = error instanceof PromotionConflictError;
         this.store.setPromotionRepository(jobId, run.repositoryId, 'failed', { error: error instanceof Error ? error.message : String(error), conflict });

@@ -53,6 +53,7 @@ Send `Authorization: Bearer <RUNNER_API_TOKEN-or-app-access-token>` on protected
 - `GET /jobs/:id/events` (SSE; supports `Last-Event-ID` replay)
 - `POST /jobs/:id/cancel`
 - `POST /jobs/:id/reply` with `{ "message": "..." }` when status is `needs_input`
+- `GET /jobs/:id/deployments`, `GET /deployments/:id` (sanitized deployment status)
 
 Create-project payloads contain `name` and a nonempty `repositories` array of `{ name, path }`. Create-job payloads contain `projectId`, `prompt`, nonempty unique `selectedRepositoryIds`, and an optional `agent` of `mock`, `codex`, or `claude` (default `mock`). Selected repositories are checked against the project. At execution time real adapters re-resolve every path, check the workspace boundary and Git repository status, then work only in isolated worktrees.
 
@@ -67,3 +68,41 @@ npm start
 The worker recovers jobs left in `running` after a process crash by re-queuing them at startup. Cancellation and graceful shutdown send `SIGTERM` to an active agent process group on Linux, then `SIGKILL` after the configured grace period. Automated tests use fake Codex and Claude executables and never call either real model service.
 
 For a safe real read-only Claude smoke test, create a project for a disposable Git repository inside `WORKSPACE_ROOT`, submit a job with `agent: "claude"` and a prompt such as “Read the selected repository and summarize its README; do not modify files or run commands,” then verify the terminal status, final response, and an empty `changedFiles` list in the retained worktree's `repository_result`. Do not use a repository containing secrets.
+
+## One-time EC2 backend deployment setup
+
+Automatic deployment is opt-in and applies only when the real path in `BACKEND_DEPLOY_REPOSITORY_PATH` is the repository successfully pushed by Review & Push. Other repositories (including the Render-managed frontend) never create an EC2 deployment. The API records the exact pushed SHA before asking systemd to start a detached one-shot unit. SQLite prevents a second queued/deploying request, while `flock` is a defense-in-depth process lock.
+
+Run these commands once on EC2, substituting the checkout path and service account only if your installation differs. They install repository-managed files; they do not alter the runtime `.env` automatically:
+
+```bash
+cd /srv/remote-coder-backend
+sudo install -d -o root -g root -m 0755 /usr/local/lib/remote-coder /etc/remote-coder
+sudo install -o root -g root -m 0755 scripts/deploy-backend.mjs /usr/local/lib/remote-coder/deploy-backend.mjs
+sudo install -o root -g root -m 0644 deploy/remote-coder-deploy@.service /etc/systemd/system/remote-coder-deploy@.service
+sudo tee /etc/sudoers.d/remote-coder-deployment >/dev/null <<'EOF'
+remote-coder ALL=(root) NOPASSWD: /usr/bin/systemctl restart remote-coder-backend.service
+EOF
+sudo chmod 0440 /etc/sudoers.d/remote-coder-deployment
+sudo visudo -cf /etc/sudoers.d/remote-coder-deployment
+sudo sh -c 'umask 077; printf "DEPLOYMENT_API_TOKEN=%s\nDEPLOYMENT_API_URL=http://127.0.0.1:4000\n" "$(openssl rand -hex 32)" > /etc/remote-coder/deployment.env'
+sudo systemctl daemon-reload
+```
+
+Copy the generated `DEPLOYMENT_API_TOKEN` value into the existing secret environment configuration for `remote-coder-backend.service`, and add these non-secret settings there:
+
+```text
+BACKEND_DEPLOY_REPOSITORY_PATH=/srv/remote-coder-backend
+```
+
+Then restart the backend once: `sudo systemctl restart remote-coder-backend.service`. The `remote-coder` backend service account also needs permission to start only deployment instances. Install this narrowly scoped policy, then restart the backend again if needed:
+
+```bash
+sudo tee /etc/sudoers.d/remote-coder-deployment-start >/dev/null <<'EOF'
+remote-coder ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block remote-coder-deploy@*.service
+EOF
+sudo chmod 0440 /etc/sudoers.d/remote-coder-deployment-start
+sudo visudo -cf /etc/sudoers.d/remote-coder-deployment-start
+```
+
+The backend invokes the start command through `sudo` using that exact policy. Never put either token on a command line. Deployment command output is discarded, and persisted failures use bounded error codes only. The script refuses a dirty checkout, fetches the configured remote branch, checks out the approved SHA directly (even if the branch later advances), runs `npm ci`, `npm test`, and `npm run build`, restarts `remote-coder-backend.service`, and verifies `/health`. On failure after checkout it rebuilds the previous SHA, restarts, checks health, and records `rolled_back`; a failed rollback records `failed`.
