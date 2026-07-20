@@ -83,6 +83,14 @@ test('queues one exact-commit backend deployment and exposes only sanitized auth
   await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(f.starts.length, 1);
 });
 
+test('Fastify parser errors on claim and state remain client errors', async () => {
+  const f = await setup();
+  for (const path of [`/internal/deployments/${crypto.randomUUID()}/claim`, `/internal/deployments/${crypto.randomUUID()}/state`]) {
+    const response = await f.app.inject({ method: 'POST', url: path, headers: { authorization: 'Bearer deploy-token', 'content-type': 'application/json' }, payload: '' });
+    assert.equal(response.statusCode, 400, response.body);
+  }
+});
+
 test('frontend-only promotion does not queue an EC2 deployment', async () => {
   const f = await setup(2, 0); appendFileSync(join(f.prepared[1].worktreePath, 'README.md'), 'frontend\n');
   const response = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'Frontend only', approvedRepositoryIds: [f.project.repositories[1].id] } });

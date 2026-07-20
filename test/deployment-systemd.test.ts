@@ -30,6 +30,9 @@ test('deployment assets retain hardening and narrowly scope Polkit authorization
   assert.match(rules, /verb === "restart".*remote-coder-backend\.service/s);
   assert.match(rules, /return polkit\.Result\.NO;/);
   assert.doesNotMatch(script, /\/usr\/bin\/sudo/);
+  assert.match(script, /body === undefined \? \{\} : \{ 'content-type': 'application\/json' \}/);
+  assert.match(script, /request\(`\/internal\/deployments\/\$\{id\}\/claim`\)/);
+  assert.match(script, /request\(`\/internal\/deployments\/\$\{id\}\/state`, \{ status, stage/);
   assert.equal(script.match(/run\('\/usr\/bin\/systemctl', \['restart', 'remote-coder-backend\.service'\]/g)?.length, 2);
 
   let authorize: ((action: { id: string; lookup: (key: string) => string }, subject: { user: string }) => string) | undefined;

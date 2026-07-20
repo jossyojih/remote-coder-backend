@@ -5,8 +5,8 @@ const id = process.argv[2];
 const api = process.env.DEPLOYMENT_API_URL ?? 'http://127.0.0.1:4000';
 const token = process.env.DEPLOYMENT_API_TOKEN;
 if (!id || !/^[0-9a-f-]{36}$/.test(id) || !token) process.exit(2);
-const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 const request = async (path, body) => {
+  const headers = { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) };
   const response = await fetch(`${api}${path}`, { method: 'POST', headers, body: body === undefined ? undefined : JSON.stringify(body) });
   if (!response.ok) throw new Error(`api_${response.status}`);
   return response.json();

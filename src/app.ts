@@ -127,6 +127,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return reply.code(400).send({ error: 'Repository path does not exist' });
     if (error instanceof Error && error.message.includes('WORKSPACE_ROOT')) return reply.code(400).send({ error: error.message });
     if ((error as { code?: string }).code?.startsWith('SQLITE_CONSTRAINT')) return reply.code(409).send({ error: 'Resource conflicts with existing data' });
+    const statusCode = (error as { statusCode?: unknown }).statusCode;
+    if (typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500) return reply.code(statusCode).send({ error: error instanceof Error ? error.message : 'Bad request' });
     app.log.error({ err: error }, 'request failed');
     return reply.code(500).send({ error: 'Internal server error' });
   });
