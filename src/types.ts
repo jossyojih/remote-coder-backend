@@ -26,8 +26,16 @@ export interface Job {
   agent: 'mock' | 'codex' | 'claude';
   status: JobStatus;
   selectedRepositoryIds: string[];
+  parentJobId?: string;
+  threadId: string;
+  conversationContext?: string;
   createdAt: string;
   updatedAt: string;
+  finalResponse?: string;
+  usage?: Record<string, unknown>;
+  repositoryResults?: Array<Record<string, unknown>>;
+  error?: string;
+  question?: string;
 }
 
 export type AgentEventEmitter = (type: string, message: string, data?: unknown) => void;

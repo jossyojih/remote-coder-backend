@@ -40,7 +40,8 @@ export function stopProcess(child: ChildProcess, graceMs: number): void {
 
 export function buildJobPrompt(job: Job, repositories: PreparedRepository[], runDirectory: string): string {
   const listing = repositories.map(({ repository, worktreePath }) => `- ${repository.name}: ${worktreePath}`).join('\n');
-  return `You are executing backend job ${job.id} in an isolated run directory.\n\nSelected repositories (all and only the repositories you may access):\n${listing}\n\nRequested outcome:\n${job.prompt}\n\nRules:\n- Do not read, write, or traverse outside ${runDirectory}.\n- Work only in the selected repository directories listed above.\n- Do not create or use subagents.\n- Run relevant tests and builds for the changes you make.\n- Do not commit, push, deploy, or delete worktrees.\n- Finish with a concise summary of changes and validation results.\n`;
+  const prior = job.conversationContext ? `\n\nPrior conversation context (bounded, oldest to newest):\n${job.conversationContext}` : '';
+  return `You are executing backend job ${job.id} in an isolated run directory.\n\nSelected repositories (all and only the repositories you may access):\n${listing}${prior}\n\nCurrent user request:\n${job.prompt}\n\nRules:\n- Do not read, write, or traverse outside ${runDirectory}.\n- Work only in the selected repository directories listed above.\n- Do not create or use subagents.\n- Run relevant tests and builds for the changes you make.\n- Do not commit, push, deploy, or delete worktrees.\n- Finish with a concise summary of changes and validation results.\n`;
 }
 
 export async function prepareRepositories(job: Job, repositories: Repository[], workspaceRoot: string, runsRootOption: string, emit: AgentEventEmitter): Promise<{ runDirectory: string; prepared: PreparedRepository[] }> {

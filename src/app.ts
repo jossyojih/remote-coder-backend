@@ -6,7 +6,7 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { createJobSchema, createProjectSchema, idParamsSchema, replySchema } from './schemas.js';
+import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, replySchema } from './schemas.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
 
@@ -148,6 +148,20 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.get('/jobs/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const job = store.getJob(id);
     return job ?? reply.code(404).send({ error: 'Job not found' });
+  });
+  app.get('/jobs/:id/conversation', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const conversation = store.conversation(id);
+    return conversation ?? reply.code(404).send({ error: 'Job not found' });
+  });
+  app.post('/jobs/:id/follow-ups', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const input = followUpSchema.parse(request.body);
+    const result = store.createFollowUp(id, input.message, input.requestId);
+    if (result.conflict === 'not_found') return reply.code(404).send({ error: 'Job not found' });
+    if (result.conflict === 'parent_active') return reply.code(409).send({ error: 'Only terminal jobs can be continued' });
+    if (result.conflict === 'not_latest') return reply.code(409).send({ error: 'Only the latest job in a conversation can be continued' });
+    if (result.conflict === 'thread_active') return reply.code(409).send({ error: 'This conversation already has an active job' });
+    if (result.conflict === 'scope_invalid') return reply.code(409).send({ error: 'The original repository scope is no longer valid' });
+    worker.wake(); return reply.code(201).send(result.job);
   });
   app.post('/jobs/:id/cancel', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);

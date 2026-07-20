@@ -24,3 +24,8 @@ export const createJobSchema = z.object({
 export const replySchema = z.object({
   message: z.string().trim().min(1).max(100_000),
 });
+
+export const followUpSchema = z.object({
+  message: z.string().trim().min(1).max(100_000),
+  requestId: z.string().uuid(),
+});
