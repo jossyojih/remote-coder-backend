@@ -1,0 +1,71 @@
+import assert from 'node:assert/strict';
+import { appendFileSync, chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, test } from 'node:test';
+import type { FastifyInstance } from 'fastify';
+import { buildApp } from '../src/app.js';
+import { prepareRepositories, runCommand } from '../src/agent-runtime.js';
+
+const apps: FastifyInstance[] = []; const token = 'promotion-test-token'; const auth = { authorization: `Bearer ${token}` };
+afterEach(async () => { await Promise.all(apps.splice(0).map((app) => app.close())); });
+
+async function gitRepository(root: string, name: string) {
+  const remote = join(root, `${name}.git`); const source = join(root, name);
+  await runCommand('git', ['init', '--bare', remote]); await runCommand('git', ['clone', remote, source]);
+  await runCommand('git', ['config', 'user.name', 'Test Agent'], source); await runCommand('git', ['config', 'user.email', 'agent@example.test'], source);
+  writeFileSync(join(source, 'README.md'), `${name}\n`); await runCommand('git', ['add', 'README.md'], source); await runCommand('git', ['commit', '-m', 'initial'], source);
+  await runCommand('git', ['branch', '-M', 'main'], source); await runCommand('git', ['push', '-u', 'origin', 'main'], source);
+  return { remote, source, initial: (await runCommand('git', ['rev-parse', 'HEAD'], source)).stdout.trim() };
+}
+
+async function setup(count = 1) {
+  const root = mkdtempSync(join(tmpdir(), 'promotion-')); const runsRoot = join(root, 'runs'); mkdirSync(runsRoot);
+  const repositories = []; for (let i = 0; i < count; i++) repositories.push(await gitRepository(root, `repo-${i + 1}`));
+  const built = await buildApp({ databasePath: join(root, 'db.sqlite'), workspaceRoot: root, runsRoot, apiToken: token, mockStepDelayMs: 10_000 }); apps.push(built.app);
+  const project = (await built.app.inject({ method: 'POST', url: '/projects', headers: auth, payload: { name: 'Project', repositories: repositories.map((r, i) => ({ name: `Repo ${i + 1}`, path: r.source })) } })).json();
+  const created = (await built.app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: project.id, prompt: 'fake agent changes', selectedRepositoryIds: project.repositories.map((r: { id: string }) => r.id), agent: 'mock' } })).json();
+  await built.app.inject({ method: 'POST', url: `/jobs/${created.id}/cancel`, headers: auth });
+  built.store.resolveScope(created.id, project.repositories.map((r: { id: string }) => r.id), []);
+  const prepared = (await prepareRepositories(built.store.getJob(created.id)!, built.store.repositories(project.repositories.map((r: { id: string }) => r.id)), root, runsRoot, (_type, _message, data) => built.store.recordRepositoryRun({ jobId: created.id, ...(data as Omit<import('../src/types.js').JobRepositoryRun, 'jobId'>) }))).prepared;
+  built.store.setStatus(created.id, 'done'); return { ...built, root, runsRoot, repositories, project, jobId: created.id, prepared };
+}
+
+test('worktrees use the latest remote commit and review returns bounded file diffs', async () => {
+  const f = await setup(); writeFileSync(join(f.prepared[0].worktreePath, 'change.txt'), 'hello\n');
+  assert.equal(f.prepared[0].baseCommitSha, f.repositories[0].initial);
+  const response = await f.app.inject({ url: `/jobs/${f.jobId}/changes`, headers: auth }); assert.equal(response.statusCode, 200);
+  const body = response.json(); assert.equal(body.repositories[0].changedFiles[0].path, 'change.txt'); assert.equal(body.repositories[0].additions, 2); assert.ok(body.limits.perFileDiffBytes <= 32_000);
+});
+
+test('promotes safely, returns commit metadata, and is idempotent', async () => {
+  const f = await setup(); appendFileSync(join(f.prepared[0].worktreePath, 'README.md'), 'approved\n');
+  const payload = { commitMessage: 'Approved change', approvedRepositoryIds: [f.project.repositories[0].id] };
+  const first = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(first.statusCode, 200, first.body);
+  const result = first.json(); assert.equal(result.status, 'promoted'); assert.match(result.repositories[0].commitSha, /^[a-f0-9]{40}$/); assert.equal(result.repositories[0].targetBranch, 'main');
+  const second = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(second.statusCode, 200); assert.equal(second.json().repositories[0].commitSha, result.repositories[0].commitSha);
+});
+
+test('rejects stale remotes without pushing job changes', async () => {
+  const f = await setup(); appendFileSync(join(f.prepared[0].worktreePath, 'README.md'), 'job\n');
+  const other = join(f.root, 'other'); await runCommand('git', ['clone', '--branch', 'main', f.repositories[0].remote, other]); await runCommand('git', ['config', 'user.name', 'Other'], other); await runCommand('git', ['config', 'user.email', 'other@example.test'], other);
+  writeFileSync(join(other, 'remote.txt'), 'advanced\n'); await runCommand('git', ['add', 'remote.txt'], other); await runCommand('git', ['commit', '-m', 'advance'], other); await runCommand('git', ['push', 'origin', 'main'], other);
+  const response = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'Should conflict', approvedRepositoryIds: [f.project.repositories[0].id] } });
+  assert.equal(response.statusCode, 409); assert.equal(response.json().repositories[0].conflict, true); assert.match(response.json().repositories[0].error, /advanced/);
+});
+
+test('supports multi-repository partial failure and retries only failed repositories', async () => {
+  const f = await setup(2); for (const repo of f.prepared) appendFileSync(join(repo.worktreePath, 'README.md'), 'job\n');
+  const hook = join(f.repositories[1].remote, 'hooks', 'pre-receive'); writeFileSync(hook, '#!/bin/sh\nexit 1\n'); chmodSync(hook, 0o755);
+  const payload = { commitMessage: 'Both repos', approvedRepositoryIds: f.project.repositories.map((r: { id: string }) => r.id) };
+  const first = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(first.statusCode, 409); assert.deepEqual(first.json().repositories.map((r: { status: string }) => r.status), ['promoted', 'failed']);
+  writeFileSync(hook, '#!/bin/sh\nexit 0\n'); const retry = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(retry.statusCode, 200, retry.body); assert.ok(retry.json().repositories.every((r: { status: string }) => r.status === 'promoted'));
+});
+
+test('does not promote no-change jobs and rejects injection-shaped inputs', async () => {
+  const f = await setup(); const review = (await f.app.inject({ url: `/jobs/${f.jobId}/changes`, headers: auth })).json(); assert.equal(review.hasChanges, false);
+  assert.equal((await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: '--upload-pack=evil', approvedRepositoryIds: [f.project.repositories[0].id] } })).statusCode, 409);
+  appendFileSync(join(f.prepared[0].worktreePath, 'README.md'), 'safe\n');
+  const injected = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'safe\0bad', approvedRepositoryIds: [f.project.repositories[0].id] } }); assert.equal(injected.statusCode, 400);
+  const pathAttempt = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'x', approvedRepositoryIds: ['../../repo'] } }); assert.equal(pathAttempt.statusCode, 400);
+});

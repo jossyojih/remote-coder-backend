@@ -54,7 +54,10 @@ export class JobWorker {
     while (this.active) await new Promise((resolve) => setTimeout(resolve, 5));
   }
 
-  private emit(jobId: string, type: string, message: string, data?: unknown) { this.bus.publish(this.store.addEvent(jobId, type, message, data)); }
+  private emit(jobId: string, type: string, message: string, data?: unknown) {
+    if (type === 'worktree' && data && typeof data === 'object') this.store.recordRepositoryRun({ jobId, ...(data as Omit<import('./types.js').JobRepositoryRun, 'jobId'>) });
+    this.bus.publish(this.store.addEvent(jobId, type, message, data));
+  }
 
   private async tick() {
     if (this.stopping || this.active) return;

@@ -6,9 +6,10 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, replySchema, scopeDecisionSchema } from './schemas.js';
+import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema } from './schemas.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
+import { PromotionConflictError, PromotionService } from './promotion.js';
 
 export interface AppOptions {
   databasePath?: string;
@@ -65,13 +66,15 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const loginLimiter = new LoginRateLimiter(options.loginRateLimit, loginRateWindowMs, now);
   const workspaceRoot = options.workspaceRoot ?? process.env.WORKSPACE_ROOT ?? process.cwd();
   const store = new Store(options.databasePath ?? process.env.DATABASE_PATH ?? './data/command-center.sqlite');
+  const runsRoot = options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs';
+  const promotion = new PromotionService(store, workspaceRoot, isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot));
   const bus = new JobEventBus();
   const allowMockAgent = options.allowMockAgent ?? process.env.NODE_ENV === 'test';
   const worker = new JobWorker(store, bus, {
     ...(allowMockAgent ? { mock: new MockAgentAdapter(options.mockStepDelayMs) } : {}),
     codex: new CodexAgentAdapter({
       codexBin: options.codexBin ?? process.env.CODEX_BIN ?? 'codex',
-      runsRoot: options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs',
+      runsRoot,
       workspaceRoot,
       timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
@@ -80,7 +83,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     claude: new ClaudeAgentAdapter({
       claudeBin: options.claudeBin ?? process.env.CLAUDE_BIN ?? 'claude',
       model: options.claudeModel ?? process.env.CLAUDE_MODEL ?? 'sonnet',
-      runsRoot: options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs',
+      runsRoot,
       workspaceRoot,
       timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
@@ -109,6 +112,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ZodError) return reply.code(400).send({ error: 'Validation failed', issues: error.issues });
+    if (error instanceof PromotionConflictError) return reply.code(error.code === 'not_found' ? 404 : 409).send({ error: error.message, code: error.code });
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return reply.code(400).send({ error: 'Repository path does not exist' });
     if (error instanceof Error && error.message.includes('WORKSPACE_ROOT')) return reply.code(400).send({ error: error.message });
     if ((error as { code?: string }).code?.startsWith('SQLITE_CONSTRAINT')) return reply.code(409).send({ error: 'Resource conflicts with existing data' });
@@ -163,6 +167,12 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.get('/jobs/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const job = store.getJob(id);
     return job ?? reply.code(404).send({ error: 'Job not found' });
+  });
+  app.get('/jobs/:id/changes', async (request) => promotion.review(idParamsSchema.parse(request.params).id));
+  app.post('/jobs/:id/promotions', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const input = promoteJobSchema.parse(request.body);
+    const result = await promotion.promote(id, input.commitMessage, input.approvedRepositoryIds);
+    return reply.code(result.status === 'promoted' ? 200 : 409).send(result);
   });
   app.get('/jobs/:id/conversation', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const conversation = store.conversation(id);

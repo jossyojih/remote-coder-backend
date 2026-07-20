@@ -1,10 +1,10 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { Job, JobEvent, JobStatus, Project, Repository, ScopeMode, ScopeReason } from './types.js';
+import type { Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
 
 type ProjectRow = { id: string; name: string; created_at: string };
-type RepoRow = { id: string; project_id: string; name: string; path: string; created_at: string };
+type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; created_at: string };
 type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex' | 'claude'; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
@@ -23,7 +23,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS repositories (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-        name TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL,
+        name TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL, remote_name TEXT NOT NULL DEFAULT 'origin', target_branch TEXT,
         UNIQUE(project_id, path)
       );
       CREATE TABLE IF NOT EXISTS jobs (
@@ -42,7 +42,27 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at);
       CREATE INDEX IF NOT EXISTS events_job_id ON job_events(job_id, id);
+      CREATE TABLE IF NOT EXISTS job_repository_runs (
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, repository_id TEXT NOT NULL REFERENCES repositories(id),
+        worktree_path TEXT NOT NULL, source_path TEXT NOT NULL, branch TEXT NOT NULL, remote_name TEXT NOT NULL,
+        remote_url TEXT NOT NULL, target_branch TEXT NOT NULL, base_commit_sha TEXT NOT NULL, git_common_dir TEXT NOT NULL,
+        PRIMARY KEY(job_id, repository_id)
+      );
+      CREATE TABLE IF NOT EXISTS promotions (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+        commit_message TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','promoting','promoted','failed')),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS promotion_repositories (
+        promotion_id TEXT NOT NULL REFERENCES promotions(id) ON DELETE CASCADE, repository_id TEXT NOT NULL REFERENCES repositories(id),
+        status TEXT NOT NULL CHECK(status IN ('pending','promoting','promoted','failed')), commit_sha TEXT,
+        target_branch TEXT NOT NULL, error TEXT, conflict INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+        PRIMARY KEY(promotion_id, repository_id)
+      );
     `);
+    const repositoryColumns = this.db.prepare('PRAGMA table_info(repositories)').all() as unknown as Array<{ name: string }>;
+    if (!repositoryColumns.some((column) => column.name === 'remote_name')) this.db.exec("ALTER TABLE repositories ADD COLUMN remote_name TEXT NOT NULL DEFAULT 'origin'");
+    if (!repositoryColumns.some((column) => column.name === 'target_branch')) this.db.exec('ALTER TABLE repositories ADD COLUMN target_branch TEXT');
     const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>;
     if (!jobColumns.some((column) => column.name === 'agent')) {
       this.db.exec("ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'mock'");
@@ -90,14 +110,14 @@ export class Store {
 
   close() { this.db.close(); }
 
-  createProject(name: string, repositories: Array<{ name: string; path: string }>): Project {
+  createProject(name: string, repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string }>): Project {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare('INSERT INTO projects VALUES (?, ?, ?)').run(id, name, now);
-      const insert = this.db.prepare('INSERT INTO repositories VALUES (?, ?, ?, ?, ?)');
-      for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now);
+      const insert = this.db.prepare('INSERT INTO repositories(id,project_id,name,path,created_at,remote_name,target_branch) VALUES (?, ?, ?, ?, ?, ?, ?)');
+      for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now, repo.remoteName ?? 'origin', repo.targetBranch ?? null);
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     return this.getProject(id)!;
@@ -118,7 +138,7 @@ export class Store {
     return { id: row.id, name: row.name, createdAt: row.created_at, repositories: repos.map(this.mapRepo) };
   }
 
-  private mapRepo = (row: RepoRow): Repository => ({ id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at });
+  private mapRepo = (row: RepoRow): Repository => ({ id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at, remoteName: row.remote_name ?? 'origin', targetBranch: row.target_branch ?? undefined });
 
   repositoriesBelongTo(projectId: string, ids: string[]): boolean {
     const placeholders = ids.map(() => '?').join(',');
@@ -288,5 +308,50 @@ export class Store {
   events(id: string, after = 0): JobEvent[] {
     const rows = this.db.prepare('SELECT * FROM job_events WHERE job_id = ? AND id > ? ORDER BY id').all(id, after) as unknown as EventRow[];
     return rows.map((row) => ({ id: row.id, jobId: row.job_id, type: row.type, message: row.message, data: JSON.parse(row.data), createdAt: row.created_at }));
+  }
+
+  recordRepositoryRun(run: JobRepositoryRun): void {
+    this.db.prepare(`INSERT OR REPLACE INTO job_repository_runs
+      (job_id,repository_id,worktree_path,source_path,branch,remote_name,remote_url,target_branch,base_commit_sha,git_common_dir)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`).run(run.jobId, run.repositoryId, run.worktreePath, run.sourcePath, run.branch, run.remoteName, run.remoteUrl, run.targetBranch, run.baseCommitSha, run.gitCommonDir);
+  }
+
+  repositoryRuns(jobId: string): JobRepositoryRun[] {
+    type RunRow = { job_id: string; repository_id: string; worktree_path: string; source_path: string; branch: string; remote_name: string; remote_url: string; target_branch: string; base_commit_sha: string; git_common_dir: string };
+    const rows = this.db.prepare('SELECT * FROM job_repository_runs WHERE job_id = ? ORDER BY rowid').all(jobId) as unknown as RunRow[];
+    return rows.map((r) => ({ jobId: r.job_id, repositoryId: r.repository_id, worktreePath: r.worktree_path, sourcePath: r.source_path, branch: r.branch, remoteName: r.remote_name, remoteUrl: r.remote_url, targetBranch: r.target_branch, baseCommitSha: r.base_commit_sha, gitCommonDir: r.git_common_dir }));
+  }
+
+  getPromotion(jobId: string): Promotion | undefined {
+    const row = this.db.prepare('SELECT * FROM promotions WHERE job_id = ?').get(jobId) as unknown as { id: string; job_id: string; commit_message: string; status: string; created_at: string; updated_at: string } | undefined;
+    if (!row) return undefined;
+    const repos = this.db.prepare('SELECT * FROM promotion_repositories WHERE promotion_id = ? ORDER BY rowid').all(row.id) as Array<Record<string, string | number | null>>;
+    return { id: row.id, jobId: row.job_id, commitMessage: row.commit_message, status: row.status as PromotionStatus, createdAt: row.created_at, updatedAt: row.updated_at,
+      repositories: repos.map((r) => ({ repositoryId: String(r.repository_id), status: r.status as PromotionStatus, commitSha: r.commit_sha ? String(r.commit_sha) : undefined, targetBranch: String(r.target_branch), error: r.error ? String(r.error) : undefined, conflict: Boolean(r.conflict), updatedAt: String(r.updated_at) })) };
+  }
+
+  beginPromotion(jobId: string, message: string, runs: JobRepositoryRun[]): { promotion?: Promotion; conflict?: string } {
+    const existing = this.getPromotion(jobId);
+    if (existing) {
+      if (existing.commitMessage !== message) return { conflict: 'message_mismatch' };
+      return { promotion: existing };
+    }
+    const id = crypto.randomUUID(); const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare("INSERT INTO promotions VALUES (?, ?, ?, 'pending', ?, ?)").run(id, jobId, message, now, now);
+      const insert = this.db.prepare("INSERT INTO promotion_repositories(promotion_id,repository_id,status,target_branch,updated_at) VALUES (?,?,'pending',?,?)");
+      for (const run of runs) insert.run(id, run.repositoryId, run.targetBranch, now);
+      this.db.exec('COMMIT'); return { promotion: this.getPromotion(jobId)! };
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  setPromotionRepository(jobId: string, repositoryId: string, status: PromotionStatus, result: { commitSha?: string; error?: string; conflict?: boolean } = {}): void {
+    const promotion = this.getPromotion(jobId); if (!promotion) throw new Error('Promotion not found'); const now = new Date().toISOString();
+    this.db.prepare('UPDATE promotion_repositories SET status=?,commit_sha=COALESCE(?,commit_sha),error=?,conflict=?,updated_at=? WHERE promotion_id=? AND repository_id=?')
+      .run(status, result.commitSha ?? null, result.error ?? null, result.conflict ? 1 : 0, now, promotion.id, repositoryId);
+    const states = this.db.prepare('SELECT status FROM promotion_repositories WHERE promotion_id=?').all(promotion.id) as Array<{ status: PromotionStatus }>;
+    const aggregate: PromotionStatus = states.every((r) => r.status === 'promoted') ? 'promoted' : states.some((r) => r.status === 'promoting') ? 'promoting' : states.some((r) => r.status === 'failed') ? 'failed' : 'pending';
+    this.db.prepare('UPDATE promotions SET status=?,updated_at=? WHERE id=?').run(aggregate, now, promotion.id);
   }
 }

@@ -20,6 +20,8 @@ export interface Repository {
   name: string;
   path: string;
   createdAt: string;
+  remoteName?: string;
+  targetBranch?: string;
 }
 
 export interface Job {
@@ -59,4 +61,19 @@ export interface JobEvent {
   message: string;
   data: unknown;
   createdAt: string;
+}
+
+export type PromotionStatus = 'pending' | 'promoting' | 'promoted' | 'failed';
+export interface JobRepositoryRun {
+  jobId: string; repositoryId: string; worktreePath: string; sourcePath: string;
+  branch: string; remoteName: string; remoteUrl: string; targetBranch: string;
+  baseCommitSha: string; gitCommonDir: string;
+}
+export interface PromotionRepositoryResult {
+  repositoryId: string; status: PromotionStatus; commitSha?: string;
+  targetBranch: string; error?: string; conflict?: boolean; updatedAt: string;
+}
+export interface Promotion {
+  id: string; jobId: string; commitMessage: string; status: PromotionStatus;
+  createdAt: string; updatedAt: string; repositories: PromotionRepositoryResult[];
 }

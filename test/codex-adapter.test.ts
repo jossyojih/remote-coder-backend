@@ -22,6 +22,8 @@ function repository(root: string, name: string) {
   git(path, ['init', '-q']); writeFileSync(join(path, 'README.md'), `${name}\n`);
   git(path, ['add', 'README.md']);
   git(path, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'initial']);
+  const remote = join(root, `${name}.git`); mkdirSync(remote); git(remote, ['init', '--bare', '-q']);
+  git(path, ['branch', '-M', 'main']); git(path, ['remote', 'add', 'origin', remote]); git(path, ['push', '-u', 'origin', 'main']);
   return path;
 }
 

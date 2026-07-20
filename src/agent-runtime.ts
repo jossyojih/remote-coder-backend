@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdir, realpath } from 'node:fs/promises';
-import { isAbsolute, join, relative } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { AgentEventEmitter, Job, Repository } from './types.js';
 
-export type PreparedRepository = { repository: Repository; sourcePath: string; worktreePath: string; branch: string };
+export type PreparedRepository = { repository: Repository; sourcePath: string; worktreePath: string; branch: string; remoteName: string; remoteUrl: string; targetBranch: string; baseCommitSha: string; gitCommonDir: string };
 
 function safeName(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'repository';
@@ -61,10 +61,19 @@ export async function prepareRepositories(job: Job, repositories: Repository[], 
     const rel = relative(root, sourcePath);
     if (rel.startsWith('..') || isAbsolute(rel)) throw new Error(`Repository ${repository.name} is outside WORKSPACE_ROOT`);
     await runCommand('git', ['-C', sourcePath, 'rev-parse', '--is-inside-work-tree']);
+    const remoteName = repository.remoteName ?? 'origin';
+    const remoteUrl = (await runCommand('git', ['-C', sourcePath, 'remote', 'get-url', remoteName])).stdout.trim();
+    const configuredBranch = (await runCommand('git', ['-C', sourcePath, 'symbolic-ref', '--quiet', '--short', 'HEAD'])).stdout.trim();
+    if (!/^(?!-)(?!.*\.\.)(?!.*[~^:?*\\[\\]\\\\\s])[^/]+(?:\/[^/]+)*$/.test(configuredBranch)) throw new Error(`Repository ${repository.name} has an unsafe target branch`);
+    const targetBranch = repository.targetBranch ?? configuredBranch;
+    if (!/^(?!-)(?!.*\.\.)(?!.*[~^:?*\\[\\]\\\\\s])[^/]+(?:\/[^/]+)*$/.test(targetBranch)) throw new Error(`Repository ${repository.name} has an unsafe target branch`);
+    await runCommand('git', ['-C', sourcePath, 'fetch', '--no-tags', remoteName, `+refs/heads/${targetBranch}:refs/remotes/${remoteName}/${targetBranch}`]);
+    const baseCommitSha = (await runCommand('git', ['-C', sourcePath, 'rev-parse', '--verify', `${remoteName}/${targetBranch}^{commit}`])).stdout.trim();
+    const gitCommonDir = await realpath(resolve(sourcePath, (await runCommand('git', ['-C', sourcePath, 'rev-parse', '--git-common-dir'])).stdout.trim()));
     const worktreePath = join(runDirectory, `${index + 1}-${safeName(repository.name)}-${repository.id.slice(0, 8)}`);
-    await runCommand('git', ['-C', sourcePath, 'worktree', 'add', '-b', branch, worktreePath]);
-    prepared.push({ repository, sourcePath, worktreePath, branch });
-    emit('worktree', `Prepared worktree for ${repository.name}`, { repositoryId: repository.id, directory: worktreePath, branch });
+    await runCommand('git', ['-C', sourcePath, 'worktree', 'add', '-b', branch, worktreePath, baseCommitSha]);
+    prepared.push({ repository, sourcePath, worktreePath, branch, remoteName, remoteUrl, targetBranch, baseCommitSha, gitCommonDir });
+    emit('worktree', `Prepared worktree for ${repository.name}`, { repositoryId: repository.id, worktreePath, sourcePath, branch, remoteName, remoteUrl, targetBranch, baseCommitSha, gitCommonDir });
   }
   return { runDirectory, prepared };
 }

@@ -7,6 +7,8 @@ export const createProjectSchema = z.object({
   repositories: z.array(z.object({
     name: z.string().trim().min(1).max(200),
     path: z.string().trim().min(1),
+    remoteName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).default('origin'),
+    targetBranch: z.string().trim().min(1).max(255).optional(),
   })).min(1),
 });
 
@@ -35,4 +37,12 @@ export const scopeDecisionSchema = z.object({ decision: z.enum(['approve', 'reje
 export const followUpSchema = z.object({
   message: z.string().trim().min(1).max(100_000),
   requestId: z.string().uuid(),
+});
+
+export const promoteJobSchema = z.object({
+  commitMessage: z.string().trim().min(1).max(500).refine((value) => !value.includes('\0'), 'Commit message contains an invalid character'),
+  approvedRepositoryIds: z.array(z.string().uuid()).min(1).max(100),
+}).superRefine((value, context) => {
+  if (new Set(value.approvedRepositoryIds).size !== value.approvedRepositoryIds.length)
+    context.addIssue({ code: 'custom', path: ['approvedRepositoryIds'], message: 'Repository IDs must be unique' });
 });
