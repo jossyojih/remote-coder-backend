@@ -5,10 +5,10 @@ import type { Deployment, JobRepositoryRun } from './types.js';
 
 export type DeploymentStarter = (id: string) => Promise<void>;
 
-export function systemdDeploymentStarter(sudo = '/usr/bin/sudo'): DeploymentStarter {
+export function systemdDeploymentStarter(systemctl = '/usr/bin/systemctl'): DeploymentStarter {
   return (id) => new Promise((resolve, reject) => {
     if (!/^[0-9a-f-]{36}$/.test(id)) return reject(new Error('Invalid deployment identifier'));
-    execFile(sudo, ['/usr/bin/systemctl', 'start', '--no-block', `remote-coder-deploy@${id}.service`], { timeout: 10_000 }, (error) => error ? reject(error) : resolve());
+    execFile(systemctl, ['start', '--no-block', `remote-coder-deploy@${id}.service`], { timeout: 10_000 }, (error) => error ? reject(error) : resolve());
   });
 }
 

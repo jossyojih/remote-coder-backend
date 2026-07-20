@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=remote-coder
-Group=remote-coder
+User=ubuntu
+Group=ubuntu
 EnvironmentFile=/etc/remote-coder/deployment.env
 ExecStart=/usr/bin/flock -n /run/lock/remote-coder-deploy.lock /usr/local/lib/remote-coder/deploy-backend.mjs %i
 NoNewPrivileges=true

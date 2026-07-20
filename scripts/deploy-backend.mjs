@@ -38,7 +38,7 @@ try {
   await state('deploying', 'installing'); run('npm', ['ci'], cwd);
   await state('deploying', 'testing'); run('npm', ['test'], cwd);
   await state('deploying', 'building'); run('npm', ['run', 'build'], cwd);
-  await state('deploying', 'restarting'); run('/usr/bin/sudo', ['/usr/bin/systemctl', 'restart', 'remote-coder-backend.service'], cwd);
+  await state('deploying', 'restarting'); run('/usr/bin/systemctl', ['restart', 'remote-coder-backend.service'], cwd);
   await health(); await state('succeeded', 'healthy');
 } catch (error) {
   const code = error instanceof Error && /^[a-z0-9_]+$/.test(error.message) ? error.message : 'deployment_failed';
@@ -46,7 +46,7 @@ try {
     try {
       const cwd = deployment.sourcePath;
       run('git', ['checkout', '--detach', previous], cwd); run('npm', ['ci'], cwd); run('npm', ['run', 'build'], cwd);
-      run('/usr/bin/sudo', ['/usr/bin/systemctl', 'restart', 'remote-coder-backend.service'], cwd); await health(); await state('rolled_back', 'rollback_healthy', code); process.exit(1);
+      run('/usr/bin/systemctl', ['restart', 'remote-coder-backend.service'], cwd); await health(); await state('rolled_back', 'rollback_healthy', code); process.exit(1);
     } catch { try { await state('failed', 'rollback_failed', code); } catch {} }
   } else { try { await state('failed', 'preflight_failed', code); } catch {} }
   process.exit(1);

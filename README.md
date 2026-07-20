@@ -73,18 +73,14 @@ For a safe real read-only Claude smoke test, create a project for a disposable G
 
 Automatic deployment is opt-in and applies only when the real path in `BACKEND_DEPLOY_REPOSITORY_PATH` is the repository successfully pushed by Review & Push. Other repositories (including the Render-managed frontend) never create an EC2 deployment. The API records the exact pushed SHA before asking systemd to start a detached one-shot unit. SQLite prevents a second queued/deploying request, while `flock` is a defense-in-depth process lock.
 
-Run these commands once on EC2, substituting the checkout path and service account only if your installation differs. They install repository-managed files; they do not alter the runtime `.env` automatically:
+Run these commands once on EC2, substituting the checkout path only if your installation differs. Both the backend and deployment services must run as `ubuntu`; the repository-managed Polkit rule intentionally authorizes no other user. These commands install repository-managed files; they do not alter the runtime `.env` automatically:
 
 ```bash
 cd /srv/remote-coder-backend
 sudo install -d -o root -g root -m 0755 /usr/local/lib/remote-coder /etc/remote-coder
 sudo install -o root -g root -m 0755 scripts/deploy-backend.mjs /usr/local/lib/remote-coder/deploy-backend.mjs
 sudo install -o root -g root -m 0644 deploy/remote-coder-deploy@.service /etc/systemd/system/remote-coder-deploy@.service
-sudo tee /etc/sudoers.d/remote-coder-deployment >/dev/null <<'EOF'
-remote-coder ALL=(root) NOPASSWD: /usr/bin/systemctl restart remote-coder-backend.service
-EOF
-sudo chmod 0440 /etc/sudoers.d/remote-coder-deployment
-sudo visudo -cf /etc/sudoers.d/remote-coder-deployment
+sudo install -o root -g root -m 0644 deploy/50-remote-coder-deployment.rules /etc/polkit-1/rules.d/50-remote-coder-deployment.rules
 sudo sh -c 'umask 077; printf "DEPLOYMENT_API_TOKEN=%s\nDEPLOYMENT_API_URL=http://127.0.0.1:4000\n" "$(openssl rand -hex 32)" > /etc/remote-coder/deployment.env'
 sudo systemctl daemon-reload
 ```
@@ -95,14 +91,13 @@ Copy the generated `DEPLOYMENT_API_TOKEN` value into the existing secret environ
 BACKEND_DEPLOY_REPOSITORY_PATH=/srv/remote-coder-backend
 ```
 
-Then restart the backend once: `sudo systemctl restart remote-coder-backend.service`. The `remote-coder` backend service account also needs permission to start only deployment instances. Install this narrowly scoped policy, then restart the backend again if needed:
+Before restarting, confirm the installed `remote-coder-backend.service` has both `User=ubuntu` and `NoNewPrivileges=true`. The repository-managed deployment unit also retains `NoNewPrivileges=true`. Do not remove either hardening setting: direct `systemctl` authorization is provided by Polkit and does not require privilege elevation inside either service.
 
 ```bash
-sudo tee /etc/sudoers.d/remote-coder-deployment-start >/dev/null <<'EOF'
-remote-coder ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block remote-coder-deploy@*.service
-EOF
-sudo chmod 0440 /etc/sudoers.d/remote-coder-deployment-start
-sudo visudo -cf /etc/sudoers.d/remote-coder-deployment-start
+sudo systemctl cat remote-coder-backend.service
+sudo systemctl restart remote-coder-backend.service
 ```
 
-The backend invokes the start command through `sudo` using that exact policy. Never put either token on a command line. Deployment command output is discarded, and persisted failures use bounded error codes only. The script refuses a dirty checkout, fetches the configured remote branch, checks out the approved SHA directly (even if the branch later advances), runs `npm ci`, `npm test`, and `npm run build`, restarts `remote-coder-backend.service`, and verifies `/health`. On failure after checkout it rebuilds the previous SHA, restarts, checks health, and records `rolled_back`; a failed rollback records `failed`.
+Remove the two obsolete `/etc/sudoers.d/remote-coder-deployment*` files from installations that used the previous setup after verifying the Polkit rule is installed. Do not add a replacement sudoers grant. The rule permits `ubuntu` only to start `remote-coder-deploy@*.service` instances and restart `remote-coder-backend.service`; it explicitly rejects every other systemd unit operation for that user.
+
+The backend and deployment script invoke `/usr/bin/systemctl` directly. Never put either token on a command line. Deployment command output is discarded, and persisted failures use bounded error codes only. The script refuses a dirty checkout, fetches the configured remote branch, checks out the approved SHA directly (even if the branch later advances), runs `npm ci`, `npm test`, and `npm run build`, restarts `remote-coder-backend.service`, and verifies `/health`. On failure after checkout it rebuilds the previous SHA, restarts, checks health, and records `rolled_back`; a failed rollback records `failed`.
