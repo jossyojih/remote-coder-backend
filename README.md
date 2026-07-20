@@ -12,7 +12,21 @@ npm install
 npm run dev
 ```
 
-Environment variables are not loaded automatically; export them in your shell or use your process manager. The server defaults to `127.0.0.1:4000`. `RUNNER_API_TOKEN` is required for all routes except `/health`. Repository paths must exist, resolve to real paths, and remain within `WORKSPACE_ROOT` (including after symlink resolution).
+Environment variables are not loaded automatically; export them in your shell or use your process manager. The server defaults to `127.0.0.1:4000`. Protected routes accept either the existing `RUNNER_API_TOKEN` (for trusted scripts) or a short-lived app token. Repository paths must exist, resolve to real paths, and remain within `WORKSPACE_ROOT` (including after symlink resolution).
+
+## Browser authentication and CORS
+
+Generate the browser password hash and a 256-bit session secret locally. The command reads the password from hidden terminal input (or standard input for automation); it does not accept plaintext in command-line arguments or environment variables:
+
+```bash
+npm run generate:auth
+```
+
+Copy the two output assignments directly into the EC2 service's secret environment configuration. Do not save the plaintext password, generator output, runner token, or issued access tokens in source control, logs, browser persistent storage, or analytics. Set `APP_ORIGINS` to an exact comma-separated allowlist such as `https://your-pwa.onrender.com,http://localhost:3000`; entries must include the scheme and port where applicable and must not contain paths or wildcards. `APP_TOKEN_TTL_SECONDS` defaults to 900 seconds.
+
+The PWA calls `POST /auth/login` with `{ "password": "..." }`, keeps the returned `accessToken` in memory, and sends `Authorization: Bearer <accessToken>` on API and SSE requests. The response also includes an ISO-8601 `expiresAt`; log in again after expiry. No cookie is issued. Login attempts are limited in memory per client IP (five attempts per minute by default), which is suitable for this single-instance V1 but is not a distributed limiter.
+
+CORS rejects requests carrying an unlisted `Origin`, answers allowed `OPTIONS` preflights with `Authorization`, `Content-Type`, and `Last-Event-ID` support, and exposes the exact allowed origin on normal and SSE responses. Requests without an `Origin` remain available to trusted scripts. Keep EC2 behind TLS and ensure the proxy passes the real client address consistently.
 
 Real Codex jobs use `CODEX_BIN` (default `codex`) and create persistent per-job Git worktrees below `RUNS_ROOT` (default `./data/runs`). `JOB_TIMEOUT_MS` defaults to 30 minutes and `JOB_KILL_GRACE_MS` defaults to 5 seconds. Codex runs ephemerally and non-interactively with JSONL output, approval policy `never`, and the `workspace-write` sandbox. The child receives a small environment allowlist; API keys and arbitrary job-controlled environment variables are not forwarded.
 
@@ -22,9 +36,10 @@ The service does not commit, push, clean, or remove worktrees. Each selected rep
 
 ## API
 
-Send `Authorization: Bearer <RUNNER_API_TOKEN>` on protected endpoints.
+Send `Authorization: Bearer <RUNNER_API_TOKEN-or-app-access-token>` on protected endpoints.
 
 - `GET /health`
+- `POST /auth/login` with `{ "password": "..." }`
 - `POST /projects`, `GET /projects`, `GET /projects/:id`
 - `POST /jobs`, `GET /jobs` (optional `?projectId=`), `GET /jobs/:id`
 - `GET /jobs/:id/events` (SSE; supports `Last-Event-ID` replay)
