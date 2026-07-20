@@ -6,7 +6,7 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, replySchema } from './schemas.js';
+import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, replySchema, scopeDecisionSchema } from './schemas.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
 
@@ -30,6 +30,7 @@ export interface AppOptions {
   runsRoot?: string;
   jobTimeoutMs?: number;
   jobKillGraceMs?: number;
+  allowMockAgent?: boolean;
 }
 
 export interface CommandCenterApp {
@@ -65,8 +66,9 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const workspaceRoot = options.workspaceRoot ?? process.env.WORKSPACE_ROOT ?? process.cwd();
   const store = new Store(options.databasePath ?? process.env.DATABASE_PATH ?? './data/command-center.sqlite');
   const bus = new JobEventBus();
+  const allowMockAgent = options.allowMockAgent ?? process.env.NODE_ENV === 'test';
   const worker = new JobWorker(store, bus, {
-    mock: new MockAgentAdapter(options.mockStepDelayMs),
+    ...(allowMockAgent ? { mock: new MockAgentAdapter(options.mockStepDelayMs) } : {}),
     codex: new CodexAgentAdapter({
       codexBin: options.codexBin ?? process.env.CODEX_BIN ?? 'codex',
       runsRoot: options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs',
@@ -136,10 +138,23 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
 
   app.post('/jobs', async (request, reply) => {
     const input = createJobSchema.parse(request.body);
-    if (!store.getProject(input.projectId)) return reply.code(404).send({ error: 'Project not found' });
-    if (!store.repositoriesBelongTo(input.projectId, input.selectedRepositoryIds)) return reply.code(400).send({ error: 'Every selected repository must belong to the project' });
-    const job = store.createJob(input.projectId, input.prompt, input.selectedRepositoryIds, input.agent); worker.wake();
+    const project = store.getProject(input.projectId); if (!project) return reply.code(404).send({ error: 'Project not found' });
+    const requested = input.requestedRepositoryIds ?? input.selectedRepositoryIds ?? [];
+    if (requested.length && !store.repositoriesBelongTo(input.projectId, requested)) return reply.code(400).send({ error: 'Every requested repository must belong to the project' });
+    const agent = input.agent ?? (process.env.NODE_ENV === 'test' ? 'mock' : 'codex');
+    if (agent === 'mock' && !allowMockAgent) return reply.code(400).send({ error: 'Mock agents are available only in automated tests' });
+    const legacySelection = request.body !== null && typeof request.body === 'object' && !Array.isArray(request.body)
+      && !('scopeMode' in request.body) && 'selectedRepositoryIds' in request.body;
+    const job = store.createJob(input.projectId, input.prompt, requested, agent, legacySelection ? 'manual' : input.scopeMode); worker.wake();
     return reply.code(201).send(job);
+  });
+  app.post('/jobs/:id/scope-decision', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const { decision } = scopeDecisionSchema.parse(request.body);
+    if (!store.getJob(id)) return reply.code(404).send({ error: 'Job not found' });
+    const job = store.decideScope(id, decision === 'approve');
+    if (!job) return reply.code(409).send({ error: 'Job is not waiting for a scope decision' });
+    bus.publish(store.addEvent(id, 'scope_decision', decision === 'approve' ? 'Scope expansion approved' : 'Keeping current repository scope', { decision, resolvedRepositoryIds: job.resolvedRepositoryIds }));
+    worker.wake(); return job;
   });
   app.get('/jobs', async (request) => {
     const query = request.query as { projectId?: string };

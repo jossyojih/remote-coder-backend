@@ -3,6 +3,9 @@ export const JOB_STATUSES = [
 ] as const;
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
+export const SCOPE_MODES = ['auto', 'manual', 'all'] as const;
+export type ScopeMode = (typeof SCOPE_MODES)[number];
+export interface ScopeReason { repositoryId: string; reason: string }
 
 export interface Project {
   id: string;
@@ -25,6 +28,11 @@ export interface Job {
   prompt: string;
   agent: 'mock' | 'codex' | 'claude';
   status: JobStatus;
+  scopeMode: ScopeMode;
+  requestedRepositoryIds: string[];
+  resolvedRepositoryIds: string[];
+  scopeReasons: ScopeReason[];
+  proposedRepositoryIds?: string[];
   selectedRepositoryIds: string[];
   parentJobId?: string;
   threadId: string;

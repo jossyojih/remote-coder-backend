@@ -2,6 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { FastifyBaseLogger } from 'fastify';
 import { Store } from './database.js';
 import type { AgentAdapter, Job, JobEvent, Repository } from './types.js';
+import { RepositoryScopePlanner } from './scope-planner.js';
 
 export class JobEventBus extends EventEmitter {
   publish(event: JobEvent) { this.emit(event.jobId, event); }
@@ -32,7 +33,7 @@ export class JobWorker {
   private active?: { jobId: string; controller: AbortController };
   private stopping = false;
 
-  constructor(private store: Store, private bus: JobEventBus, private adapters: Record<'mock' | 'codex' | 'claude', AgentAdapter>, private log: FastifyBaseLogger, private pollMs = 25) {}
+  constructor(private store: Store, private bus: JobEventBus, private adapters: Partial<Record<'mock' | 'codex' | 'claude', AgentAdapter>>, private log: FastifyBaseLogger, private pollMs = 25, private planner = new RepositoryScopePlanner()) {}
 
   start() { this.timer = setInterval(() => void this.tick(), this.pollMs); this.timer.unref(); void this.tick(); }
   wake() { void this.tick(); }
@@ -62,9 +63,29 @@ export class JobWorker {
     const controller = new AbortController(); this.active = { jobId: job.id, controller };
     this.emit(job.id, 'status', 'Job started', { status: 'running' });
     try {
-      const repositories = this.store.repositories(job.selectedRepositoryIds);
-      if (repositories.length !== job.selectedRepositoryIds.length) throw new Error('One or more selected repositories no longer exist');
-      await this.adapters[job.agent].run(job, repositories, (type, message, data) => this.emit(job.id, type, message, data), controller.signal);
+      let current = job;
+      if (this.store.scopeState(job.id) === 'pending') {
+        const project = this.store.getProject(job.projectId); if (!project) throw new Error('Project no longer exists');
+        const plan = job.scopeMode === 'all'
+          ? { repositoryIds: project.repositories.map((repository) => repository.id), reasons: project.repositories.map((repository) => ({ repositoryId: repository.id, reason: 'All repositories were explicitly granted for this job.' })) }
+          : this.planner.plan(job.prompt.slice(0, 100_000), project.repositories);
+        if (job.scopeMode === 'manual') {
+          const additional = plan.repositoryIds.filter((id) => !job.requestedRepositoryIds.includes(id));
+          if (additional.length) {
+            this.store.proposeScope(job.id, additional, plan.reasons);
+            this.emit(job.id, 'scope_proposal', 'Additional repository access is required', { status: 'needs_input', requestedRepositoryIds: job.requestedRepositoryIds, proposedRepositoryIds: additional, reasons: plan.reasons });
+            return;
+          }
+          const reasons = job.requestedRepositoryIds.map((repositoryId) => plan.reasons.find((reason) => reason.repositoryId === repositoryId) ?? { repositoryId, reason: 'Explicitly selected for manual scope.' });
+          this.store.resolveScope(job.id, job.requestedRepositoryIds, reasons);
+        } else this.store.resolveScope(job.id, plan.repositoryIds, plan.reasons);
+        current = this.store.getJob(job.id)!;
+        this.emit(job.id, 'scope_resolved', `Resolved repository scope to ${current.resolvedRepositoryIds.length} repository${current.resolvedRepositoryIds.length === 1 ? '' : 'ies'}`, { scopeMode: current.scopeMode, requestedRepositoryIds: current.requestedRepositoryIds, resolvedRepositoryIds: current.resolvedRepositoryIds, reasons: current.scopeReasons });
+      }
+      const repositories = this.store.repositories(current.resolvedRepositoryIds);
+      if (repositories.length !== current.resolvedRepositoryIds.length || repositories.length === 0) throw new Error('Resolved repository scope is empty or invalid');
+      const adapter = this.adapters[current.agent]; if (!adapter) throw new Error(`Agent ${current.agent} is not available`);
+      await adapter.run(current, repositories, (type, message, data) => this.emit(job.id, type, message, data), controller.signal);
       if (this.store.getJob(job.id)?.status === 'running') {
         this.store.setStatus(job.id, 'done');
         this.emit(job.id, 'status', 'Job completed', { status: 'done' });

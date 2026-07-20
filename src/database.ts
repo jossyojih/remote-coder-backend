@@ -1,11 +1,11 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { Job, JobEvent, JobStatus, Project, Repository } from './types.js';
+import type { Job, JobEvent, JobStatus, Project, Repository, ScopeMode, ScopeReason } from './types.js';
 
 type ProjectRow = { id: string; name: string; created_at: string };
 type RepoRow = { id: string; project_id: string; name: string; path: string; created_at: string };
-type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex' | 'claude'; status: JobStatus; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string };
+type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex' | 'claude'; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
 function objectData(value: unknown): Record<string, unknown> | undefined {
@@ -71,6 +71,14 @@ export class Store {
     if (!migratedJobColumns.some((column) => column.name === 'thread_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN thread_id TEXT');
     if (!migratedJobColumns.some((column) => column.name === 'conversation_context')) this.db.exec("ALTER TABLE jobs ADD COLUMN conversation_context TEXT NOT NULL DEFAULT ''");
     if (!migratedJobColumns.some((column) => column.name === 'follow_up_request_id')) this.db.exec('ALTER TABLE jobs ADD COLUMN follow_up_request_id TEXT');
+    if (!migratedJobColumns.some((column) => column.name === 'scope_mode')) this.db.exec("ALTER TABLE jobs ADD COLUMN scope_mode TEXT NOT NULL DEFAULT 'manual'");
+    if (!migratedJobColumns.some((column) => column.name === 'scope_state')) this.db.exec("ALTER TABLE jobs ADD COLUMN scope_state TEXT NOT NULL DEFAULT 'resolved'");
+    if (!migratedJobColumns.some((column) => column.name === 'scope_reasons')) this.db.exec("ALTER TABLE jobs ADD COLUMN scope_reasons TEXT NOT NULL DEFAULT '[]'");
+    if (!migratedJobColumns.some((column) => column.name === 'proposed_repository_ids')) this.db.exec("ALTER TABLE jobs ADD COLUMN proposed_repository_ids TEXT NOT NULL DEFAULT '[]'");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS job_requested_repositories (job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, repository_id TEXT NOT NULL REFERENCES repositories(id), PRIMARY KEY(job_id,repository_id));
+      INSERT OR IGNORE INTO job_requested_repositories SELECT job_id, repository_id FROM job_repositories;
+    `);
     this.db.exec(`
       UPDATE jobs SET thread_id = id WHERE thread_id IS NULL OR thread_id = '';
       CREATE INDEX IF NOT EXISTS jobs_thread_created ON jobs(thread_id, created_at);
@@ -127,12 +135,12 @@ export class Store {
     return ids.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
   }
 
-  createJob(projectId: string, prompt: string, repositoryIds: string[], agent: 'mock' | 'codex' | 'claude' = 'mock'): Job {
+  createJob(projectId: string, prompt: string, repositoryIds: string[], agent: 'mock' | 'codex' | 'claude', scopeMode: ScopeMode): Job {
     const id = crypto.randomUUID(); const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, projectId, prompt, 'queued', now, now, agent, id);
-      const insert = this.db.prepare('INSERT INTO job_repositories VALUES (?, ?)');
+      this.db.prepare('INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,thread_id,scope_mode,scope_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, projectId, prompt, 'queued', now, now, agent, id, scopeMode, 'pending');
+      const insert = this.db.prepare('INSERT INTO job_requested_repositories VALUES (?, ?)');
       for (const repositoryId of repositoryIds) insert.run(id, repositoryId);
       this.addEvent(id, 'status', 'Job queued', { status: 'queued' });
       this.db.exec('COMMIT');
@@ -169,15 +177,45 @@ export class Store {
     }).at(-1);
     const questionData = objectData(questionEvent?.data);
     const question = questionEvent ? (typeof questionData?.question === 'string' ? questionData.question : questionEvent.message) : undefined;
+    const requested = this.db.prepare('SELECT repository_id FROM job_requested_repositories WHERE job_id = ? ORDER BY rowid').all(row.id) as unknown as Array<{ repository_id: string }>;
+    const reasons = JSON.parse(row.scope_reasons ?? '[]') as ScopeReason[];
+    const proposed = JSON.parse(row.proposed_repository_ids ?? '[]') as string[];
     const job: Job = {
       id: row.id, projectId: row.project_id, prompt: row.prompt, agent: row.agent ?? 'mock', status: row.status,
-      selectedRepositoryIds: selected.map((x) => x.repository_id), parentJobId: row.parent_job_id ?? undefined,
+      scopeMode: row.scope_mode ?? 'manual', requestedRepositoryIds: requested.map((x) => x.repository_id), resolvedRepositoryIds: selected.map((x) => x.repository_id), scopeReasons: reasons,
+      proposedRepositoryIds: proposed.length ? proposed : undefined,
+      selectedRepositoryIds: selected.length ? selected.map((x) => x.repository_id) : requested.map((x) => x.repository_id), parentJobId: row.parent_job_id ?? undefined,
       threadId: row.thread_id ?? row.id,
       createdAt: row.created_at, updatedAt: row.updated_at, finalResponse, usage,
       repositoryResults: repositoryResults.length ? repositoryResults : undefined, error, question,
     };
     if (row.conversation_context) Object.defineProperty(job, 'conversationContext', { value: row.conversation_context, enumerable: false });
     return job;
+  }
+
+  scopeState(id: string): string | undefined { return (this.db.prepare('SELECT scope_state FROM jobs WHERE id = ?').get(id) as { scope_state: string } | undefined)?.scope_state; }
+
+  resolveScope(id: string, repositoryIds: string[], reasons: ScopeReason[], state = 'resolved'): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM job_repositories WHERE job_id = ?').run(id);
+      const insert = this.db.prepare('INSERT INTO job_repositories VALUES (?, ?)');
+      for (const repositoryId of repositoryIds) insert.run(id, repositoryId);
+      this.db.prepare('UPDATE jobs SET scope_state = ?, scope_reasons = ?, proposed_repository_ids = ?, updated_at = ? WHERE id = ?').run(state, JSON.stringify(reasons), '[]', new Date().toISOString(), id);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
+  proposeScope(id: string, repositoryIds: string[], reasons: ScopeReason[]): void {
+    this.db.prepare("UPDATE jobs SET scope_state = 'awaiting_decision', scope_reasons = ?, proposed_repository_ids = ?, status = 'needs_input', updated_at = ? WHERE id = ?")
+      .run(JSON.stringify(reasons), JSON.stringify(repositoryIds), new Date().toISOString(), id);
+  }
+
+  decideScope(id: string, approve: boolean): Job | undefined {
+    const job = this.getJob(id); if (!job || job.status !== 'needs_input' || this.scopeState(id) !== 'awaiting_decision') return undefined;
+    const resolved = approve ? [...new Set([...job.requestedRepositoryIds, ...(job.proposedRepositoryIds ?? [])])] : job.requestedRepositoryIds;
+    const reasons = job.scopeReasons.filter((reason) => resolved.includes(reason.repositoryId));
+    this.resolveScope(id, resolved, reasons, 'resolved'); this.setStatus(id, 'queued'); return this.getJob(id);
   }
 
   conversation(jobId: string): Job[] | undefined {
@@ -203,11 +241,13 @@ export class Store {
       if (!this.repositoriesBelongTo(parentRow.project_id, repositoryIds)) { this.db.exec('ROLLBACK'); return { conflict: 'scope_invalid' }; }
       const id = crypto.randomUUID(); const now = new Date().toISOString();
       const context = this.buildConversationContext(threadId);
-      this.db.prepare(`INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,parent_job_id,thread_id,conversation_context,follow_up_request_id)
-        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)`)
-        .run(id, parentRow.project_id, message, now, now, parentRow.agent, parentId, threadId, context, requestId);
+      this.db.prepare(`INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,parent_job_id,thread_id,conversation_context,follow_up_request_id,scope_mode,scope_state,scope_reasons)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, 'resolved', ?)`)
+        .run(id, parentRow.project_id, message, now, now, parentRow.agent, parentId, threadId, context, requestId, parentRow.scope_mode, parentRow.scope_reasons);
       const insert = this.db.prepare('INSERT INTO job_repositories VALUES (?, ?)');
       for (const repositoryId of repositoryIds) insert.run(id, repositoryId);
+      const insertRequested = this.db.prepare('INSERT INTO job_requested_repositories VALUES (?, ?)');
+      for (const repositoryId of repositoryIds) insertRequested.run(id, repositoryId);
       this.addEvent(id, 'status', 'Follow-up queued', { status: 'queued', parentJobId: parentId, threadId });
       this.db.exec('COMMIT'); return { job: this.getJob(id)! };
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }

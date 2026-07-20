@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "generate:auth": "node --import tsx src/generate-auth-secrets.ts",
     "start": "node dist/src/server.js",
-    "test": "tsc -p tsconfig.test.json && node --test .test-dist/test/**/*.test.js"
+    "test": "tsc -p tsconfig.test.json && NODE_ENV=test node --test .test-dist/test/**/*.test.js"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",

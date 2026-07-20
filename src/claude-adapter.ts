@@ -102,7 +102,7 @@ export class ClaudeAgentAdapter implements AgentAdapter {
     const { runDirectory, prepared } = await prepareRepositories(job, repositories, this.options.workspaceRoot, this.options.runsRoot, emit);
     await this.executeClaude(job.id, buildJobPrompt(job, prepared, runDirectory), runDirectory, emit, signal);
     for (const repository of prepared) {
-      try { emit('repository_result', `Collected changes for ${repository.repository.name}`, await collectChanges(repository)); }
+      try { emit('repository_result', `Collected changes for ${repository.repository.name}`, { ...(await collectChanges(repository)), scopeReason: job.scopeReasons.find((reason) => reason.repositoryId === repository.repository.id)?.reason }); }
       catch (error) { emit('error', `Could not collect changes for ${repository.repository.name}`, { error: error instanceof Error ? error.message : String(error) }); }
     }
   }
