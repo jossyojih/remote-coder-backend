@@ -23,7 +23,7 @@ export interface Job {
   id: string;
   projectId: string;
   prompt: string;
-  agent: 'mock' | 'codex';
+  agent: 'mock' | 'codex' | 'claude';
   status: JobStatus;
   selectedRepositoryIds: string[];
   createdAt: string;

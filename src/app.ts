@@ -5,6 +5,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
+import { ClaudeAgentAdapter } from './claude-adapter.js';
 import { createJobSchema, createProjectSchema, idParamsSchema, replySchema } from './schemas.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 
@@ -16,6 +17,8 @@ export interface AppOptions {
   logger?: boolean;
   mockStepDelayMs?: number;
   codexBin?: string;
+  claudeBin?: string;
+  claudeModel?: string;
   runsRoot?: string;
   jobTimeoutMs?: number;
   jobKillGraceMs?: number;
@@ -48,6 +51,15 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     mock: new MockAgentAdapter(options.mockStepDelayMs),
     codex: new CodexAgentAdapter({
       codexBin: options.codexBin ?? process.env.CODEX_BIN ?? 'codex',
+      runsRoot: options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs',
+      workspaceRoot,
+      timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),
+      killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
+      log: app.log,
+    }),
+    claude: new ClaudeAgentAdapter({
+      claudeBin: options.claudeBin ?? process.env.CLAUDE_BIN ?? 'claude',
+      model: options.claudeModel ?? process.env.CLAUDE_MODEL ?? 'sonnet',
       runsRoot: options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs',
       workspaceRoot,
       timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),

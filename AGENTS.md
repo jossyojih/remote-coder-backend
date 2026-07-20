@@ -9,6 +9,7 @@
 - Agent adapters must receive an explicit list of selected repositories. They may not infer additional repositories or traverse outside those paths.
 - Real agent execution must occur only in per-job worktrees below `RUNS_ROOT`; never modify an original checkout directly.
 - Invoke agents with argument-array child processes, a restricted environment, non-interactive approvals, and a sandbox no broader than `workspace-write`. Never use danger-full-access or expose API keys through job-controlled environments.
+- Claude Code must use structured stream output with `dontAsk` plus an explicit tool allowlist. Do not use `bypassPermissions` or `--dangerously-skip-permissions`.
 - Do not automatically commit, push, remove worktrees, or delete job run directories.
 
 ## Multi-repository invariants

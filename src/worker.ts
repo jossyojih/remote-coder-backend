@@ -32,7 +32,7 @@ export class JobWorker {
   private active?: { jobId: string; controller: AbortController };
   private stopping = false;
 
-  constructor(private store: Store, private bus: JobEventBus, private adapters: Record<'mock' | 'codex', AgentAdapter>, private log: FastifyBaseLogger, private pollMs = 25) {}
+  constructor(private store: Store, private bus: JobEventBus, private adapters: Record<'mock' | 'codex' | 'claude', AgentAdapter>, private log: FastifyBaseLogger, private pollMs = 25) {}
 
   start() { this.timer = setInterval(() => void this.tick(), this.pollMs); this.timer.unref(); void this.tick(); }
   wake() { void this.tick(); }

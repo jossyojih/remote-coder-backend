@@ -1,8 +1,7 @@
-import { mkdir, realpath } from 'node:fs/promises';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { isAbsolute, join, relative } from 'node:path';
 import type { FastifyBaseLogger } from 'fastify';
 import type { AgentAdapter, AgentEventEmitter, Job, Repository } from './types.js';
+import { buildJobPrompt, childEnvironment, collectChanges, prepareRepositories, stopProcess } from './agent-runtime.js';
 
 export interface CodexAdapterOptions {
   codexBin: string;
@@ -13,8 +12,6 @@ export interface CodexAdapterOptions {
   log: FastifyBaseLogger;
 }
 
-type PreparedRepository = { repository: Repository; sourcePath: string; worktreePath: string; branch: string };
-
 export class CodexTimeoutError extends Error {
   constructor() { super('Codex execution timed out'); this.name = 'CodexTimeoutError'; }
 }
@@ -23,46 +20,7 @@ export class CodexProtocolError extends Error {
   constructor(message: string) { super(message); this.name = 'CodexProtocolError'; }
 }
 
-function safeName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'repository';
-}
-
-function childEnvironment(): NodeJS.ProcessEnv {
-  const allowed = ['PATH', 'HOME', 'CODEX_HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
-  return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]])) as NodeJS.ProcessEnv;
-}
-
-function runCommand(command: string, args: string[], cwd?: string): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env: childEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = ''; let stderr = '';
-    child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
-    child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', (code) => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(`${command} ${args[0] ?? ''} failed (${code}): ${stderr.trim()}`)));
-  });
-}
-
-function stopProcess(child: ChildProcess, graceMs: number): void {
-  if (!child.pid || child.exitCode !== null) return;
-  const signal = (name: NodeJS.Signals) => {
-    try {
-      if (process.platform === 'linux') process.kill(-child.pid!, name);
-      else child.kill(name);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
-    }
-  };
-  signal('SIGTERM');
-  const timer = setTimeout(() => { if (child.exitCode === null) signal('SIGKILL'); }, graceMs);
-  timer.unref();
-  child.once('close', () => clearTimeout(timer));
-}
-
-export function buildJobPrompt(job: Job, repositories: PreparedRepository[], runDirectory: string): string {
-  const listing = repositories.map(({ repository, worktreePath }) => `- ${repository.name}: ${worktreePath}`).join('\n');
-  return `You are executing backend job ${job.id} in an isolated run directory.\n\nSelected repositories (all and only the repositories you may access):\n${listing}\n\nRequested outcome:\n${job.prompt}\n\nRules:\n- Do not read, write, or traverse outside ${runDirectory}.\n- Work only in the selected repository directories listed above.\n- Do not create or use subagents.\n- Run relevant tests and builds for the changes you make.\n- Do not commit, push, deploy, or delete worktrees.\n- Finish with a concise summary of changes and validation results.\n`;
-}
+export { buildJobPrompt } from './agent-runtime.js';
 
 type TranslatedEvent = { type: string; message: string; data: unknown };
 
@@ -100,32 +58,12 @@ export class CodexAgentAdapter implements AgentAdapter {
   constructor(private readonly options: CodexAdapterOptions) {}
 
   async run(job: Job, repositories: Repository[], emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
-    const root = await realpath(this.options.workspaceRoot);
-    const configuredRunsRoot = isAbsolute(this.options.runsRoot) ? this.options.runsRoot : join(process.cwd(), this.options.runsRoot);
-    await mkdir(configuredRunsRoot, { recursive: true });
-    const runsRoot = await realpath(configuredRunsRoot);
-    const requestedRunDirectory = join(runsRoot, job.id);
-    await mkdir(requestedRunDirectory, { recursive: true });
-    const runDirectory = await realpath(requestedRunDirectory);
-    const runRel = relative(runsRoot, runDirectory);
-    if (runRel.startsWith('..') || isAbsolute(runRel)) throw new Error('Job run directory escapes RUNS_ROOT');
-    const branch = `remote-engineer/${job.id}`;
-    const prepared: PreparedRepository[] = [];
-    for (const [index, repository] of repositories.entries()) {
-      const sourcePath = await realpath(repository.path);
-      const rel = relative(root, sourcePath);
-      if (rel.startsWith('..') || isAbsolute(rel)) throw new Error(`Repository ${repository.name} is outside WORKSPACE_ROOT`);
-      await runCommand('git', ['-C', sourcePath, 'rev-parse', '--is-inside-work-tree']);
-      const worktreePath = join(runDirectory, `${index + 1}-${safeName(repository.name)}-${repository.id.slice(0, 8)}`);
-      await runCommand('git', ['-C', sourcePath, 'worktree', 'add', '-b', branch, worktreePath]);
-      prepared.push({ repository, sourcePath, worktreePath, branch });
-      emit('worktree', `Prepared worktree for ${repository.name}`, { repositoryId: repository.id, directory: worktreePath, branch });
-    }
+    const { runDirectory, prepared } = await prepareRepositories(job, repositories, this.options.workspaceRoot, this.options.runsRoot, emit);
 
     const prompt = buildJobPrompt(job, prepared, runDirectory);
     await this.executeCodex(job.id, prompt, runDirectory, emit, signal);
     for (const repository of prepared) {
-      try { emit('repository_result', `Collected changes for ${repository.repository.name}`, await this.collectChanges(repository)); }
+      try { emit('repository_result', `Collected changes for ${repository.repository.name}`, await collectChanges(repository)); }
       catch (error) { emit('error', `Could not collect changes for ${repository.repository.name}`, { error: error instanceof Error ? error.message : String(error) }); }
     }
   }
@@ -133,7 +71,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   private executeCodex(jobId: string, prompt: string, runDirectory: string, emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
       const args = ['exec', '--json', '--ephemeral', '--sandbox', 'workspace-write', '--skip-git-repo-check', '-c', 'approval_policy="never"', '--color', 'never', '-C', runDirectory, '-'];
-      const child = spawn(this.options.codexBin, args, { cwd: runDirectory, env: childEnvironment(), detached: process.platform === 'linux', stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = spawn(this.options.codexBin, args, { cwd: runDirectory, env: childEnvironment('codex'), detached: process.platform === 'linux', stdio: ['pipe', 'pipe', 'pipe'] });
       let settled = false; let timedOut = false; let protocolCompleted = false; let protocolError: Error | undefined;
       let latestAgentMessage: { message: string; data: unknown } | undefined;
       this.options.log.info({ jobId, adapter: 'codex', childPid: child.pid }, 'agent child started');
@@ -185,14 +123,4 @@ export class CodexAgentAdapter implements AgentAdapter {
     });
   }
 
-  private async collectChanges(prepared: PreparedRepository) {
-    const [status, files, stats] = await Promise.all([
-      runCommand('git', ['status', '--porcelain=v1'], prepared.worktreePath),
-      runCommand('git', ['diff', '--name-only', 'HEAD'], prepared.worktreePath),
-      runCommand('git', ['diff', '--stat', 'HEAD'], prepared.worktreePath),
-    ]);
-    const changedFiles = new Set(files.stdout.trim() ? files.stdout.trim().split('\n') : []);
-    for (const line of status.stdout.trimEnd().split('\n')) if (line) changedFiles.add(line.slice(3).replace(/^.* -> /, ''));
-    return { repositoryId: prepared.repository.id, repositoryName: prepared.repository.name, directory: prepared.worktreePath, branch: prepared.branch, status: status.stdout.trim(), changedFiles: [...changedFiles], diffStat: stats.stdout.trim() };
-  }
 }

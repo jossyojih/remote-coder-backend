@@ -5,7 +5,7 @@ import type { Job, JobEvent, JobStatus, Project, Repository } from './types.js';
 
 type ProjectRow = { id: string; name: string; created_at: string };
 type RepoRow = { id: string; project_id: string; name: string; path: string; created_at: string };
-type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex'; status: JobStatus; created_at: string; updated_at: string };
+type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex' | 'claude'; status: JobStatus; created_at: string; updated_at: string };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
 export class Store {
@@ -25,7 +25,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
         prompt TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','running','needs_input','failed','done','cancelled')),
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        agent TEXT NOT NULL DEFAULT 'mock' CHECK(agent IN ('mock','codex','claude'))
       );
       CREATE TABLE IF NOT EXISTS job_repositories (
         job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -40,7 +41,26 @@ export class Store {
     `);
     const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>;
     if (!jobColumns.some((column) => column.name === 'agent')) {
-      this.db.exec("ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'mock' CHECK(agent IN ('mock','codex'))");
+      this.db.exec("ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'mock'");
+    }
+    const jobsSql = (this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").get() as { sql: string }).sql;
+    if (jobsSql.includes("agent IN ('mock','codex')")) {
+      this.db.exec(`
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+        CREATE TABLE jobs_v2 (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          prompt TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','running','needs_input','failed','done','cancelled')),
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          agent TEXT NOT NULL DEFAULT 'mock' CHECK(agent IN ('mock','codex','claude'))
+        );
+        INSERT INTO jobs_v2 SELECT id, project_id, prompt, status, created_at, updated_at, agent FROM jobs;
+        DROP TABLE jobs;
+        ALTER TABLE jobs_v2 RENAME TO jobs;
+        CREATE INDEX jobs_status_created ON jobs(status, created_at);
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+      `);
     }
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
@@ -93,7 +113,7 @@ export class Store {
     return ids.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
   }
 
-  createJob(projectId: string, prompt: string, repositoryIds: string[], agent: 'mock' | 'codex' = 'mock'): Job {
+  createJob(projectId: string, prompt: string, repositoryIds: string[], agent: 'mock' | 'codex' | 'claude' = 'mock'): Job {
     const id = crypto.randomUUID(); const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {

@@ -14,7 +14,7 @@ export const createJobSchema = z.object({
   projectId: z.string().uuid(),
   prompt: z.string().trim().min(1).max(100_000),
   selectedRepositoryIds: z.array(z.string().uuid()).min(1),
-  agent: z.enum(['mock', 'codex']).default('mock'),
+  agent: z.enum(['mock', 'codex', 'claude']).default('mock'),
 }).superRefine((value, context) => {
   if (new Set(value.selectedRepositoryIds).size !== value.selectedRepositoryIds.length) {
     context.addIssue({ code: 'custom', path: ['selectedRepositoryIds'], message: 'Repository IDs must be unique' });
