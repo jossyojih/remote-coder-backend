@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import type { FastifyBaseLogger } from 'fastify';
-import { buildJobPrompt, childEnvironment, collectChanges, prepareRepositories, stopProcess } from './agent-runtime.js';
+import { buildJobPrompt, childEnvironment, collectChanges, parseScopeRequired, prepareRepositories, stopProcess } from './agent-runtime.js';
 import type { AgentAdapter, AgentEventEmitter, Job, Repository } from './types.js';
 
 export interface ClaudeAdapterOptions {
@@ -155,7 +155,9 @@ export class ClaudeAgentAdapter implements AgentAdapter {
         }
         if (!protocolCompleted) return finish(new ClaudeProtocolError('protocol_incomplete: Claude exited without a successful result'));
         if (!finalResponse) return finish(new ClaudeProtocolError('protocol_incomplete: Claude success result had no final response'));
-        emit(finalResponse.type, finalResponse.message, finalResponse.data);
+        const required = parseScopeRequired(finalResponse.message);
+        if (required) emit('scope_required', 'Additional repository scope is required', required);
+        else emit(finalResponse.type, finalResponse.message, finalResponse.data);
         finish();
       });
       child.stdin.end(prompt);

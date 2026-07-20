@@ -109,6 +109,38 @@ test('creates idempotent linked follow-ups with inherited scope and bounded cont
   assert.deepEqual(conversation.json().map((job: { id: string }) => job.id), [original.id, followUp.id]);
 });
 
+test('continue keeps, auto-selects, or manually corrects scope in the same thread', async () => {
+  const { app, root } = await fixture(500); const p = await project(app, root);
+  const original = (await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: p.id, prompt: 'Original', scopeMode: 'manual', requestedRepositoryIds: [p.repositories[0].id], agent: 'mock' } })).json();
+  await app.inject({ method: 'POST', url: `/jobs/${original.id}/cancel`, headers: auth });
+  const manual = await app.inject({ method: 'POST', url: `/jobs/${original.id}/continue`, headers: auth, payload: { message: 'Try the API repository', requestId: crypto.randomUUID(), scopeMode: 'manual', requestedRepositoryIds: [p.repositories[1].id] } });
+  assert.equal(manual.statusCode, 201); assert.deepEqual(manual.json().resolvedRepositoryIds, [p.repositories[1].id]); assert.equal(manual.json().threadId, original.id);
+  await app.inject({ method: 'POST', url: `/jobs/${manual.json().id}/cancel`, headers: auth });
+  const kept = await app.inject({ method: 'POST', url: `/jobs/${manual.json().id}/continue`, headers: auth, payload: { message: 'Keep going', requestId: crypto.randomUUID() } });
+  assert.equal(kept.statusCode, 201); assert.deepEqual(kept.json().resolvedRepositoryIds, [p.repositories[1].id]); assert.equal(kept.json().threadId, original.id);
+  await app.inject({ method: 'POST', url: `/jobs/${kept.json().id}/cancel`, headers: auth });
+  const auto = await app.inject({ method: 'POST', url: `/jobs/${kept.json().id}/continue`, headers: auth, payload: { message: 'Fix A', requestId: crypto.randomUUID(), scopeMode: 'auto' } });
+  assert.equal(auto.statusCode, 201); assert.deepEqual(auto.json().resolvedRepositoryIds, []); assert.equal(auto.json().threadId, original.id);
+});
+
+test('continue rejects duplicate and cross-project manual scope', async () => {
+  const { app, root } = await fixture(500); const p = await project(app, root); const other = await project(app, root, 'Other');
+  const original = (await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: p.id, prompt: 'Original', selectedRepositoryIds: [p.repositories[0].id] } })).json();
+  await app.inject({ method: 'POST', url: `/jobs/${original.id}/cancel`, headers: auth });
+  const response = await app.inject({ method: 'POST', url: `/jobs/${original.id}/continue`, headers: auth, payload: { message: 'Wrong project', requestId: crypto.randomUUID(), scopeMode: 'manual', requestedRepositoryIds: [other.repositories[0].id] } });
+  assert.equal(response.statusCode, 409); assert.match(response.json().error, /scope.*valid/i);
+});
+
+test('manual scope decision accepts only repositories in the job project', async () => {
+  const { app, root } = await fixture(500); const p = await project(app, root); const other = await project(app, root, 'Other');
+  const created = (await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: p.id, prompt: 'Change repo-b', scopeMode: 'manual', requestedRepositoryIds: [p.repositories[0].id] } })).json();
+  for (let attempt = 0; attempt < 100 && (await app.inject({ url: `/jobs/${created.id}`, headers: auth })).json().status !== 'needs_input'; attempt++) await new Promise((resolve) => setTimeout(resolve, 5));
+  const outside = await app.inject({ method: 'POST', url: `/jobs/${created.id}/scope-decision`, headers: auth, payload: { decision: 'choose', requestedRepositoryIds: [other.repositories[0].id] } });
+  assert.equal(outside.statusCode, 409);
+  const chosen = await app.inject({ method: 'POST', url: `/jobs/${created.id}/scope-decision`, headers: auth, payload: { decision: 'choose', requestedRepositoryIds: [p.repositories[1].id] } });
+  assert.equal(chosen.statusCode, 200); assert.deepEqual(chosen.json().resolvedRepositoryIds, [p.repositories[1].id]);
+});
+
 test('rejects follow-up on an active job and preserves needs-input replies', async () => {
   const { app, store, root } = await fixture(500); const p = await project(app, root);
   const created = (await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: p.id, prompt: 'Need info', selectedRepositoryIds: [p.repositories[0].id] } })).json();

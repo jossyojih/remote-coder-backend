@@ -40,8 +40,9 @@ export function stopProcess(child: ChildProcess, graceMs: number): void {
 
 export function buildJobPrompt(job: Job, repositories: PreparedRepository[], runDirectory: string): string {
   const listing = repositories.map(({ repository, worktreePath }) => `- ${repository.name}: ${worktreePath}`).join('\n');
+  const candidates = job.repositoryScopeCandidates?.map((repository) => `- ${repository.repositoryId}: ${repository.repositoryName} (${repository.role})`).join('\n') ?? '';
   const prior = job.conversationContext ? `\n\nPrior conversation context (bounded, oldest to newest):\n${job.conversationContext}` : '';
-  return `You are executing backend job ${job.id} in an isolated run directory.\n\nSelected repositories (all and only the repositories you may access):\n${listing}${prior}\n\nCurrent user request:\n${job.prompt}\n\nRules:\n- Do not read, write, or traverse outside ${runDirectory}.\n- Work only in the selected repository directories listed above.\n- Do not create or use subagents.\n- Run relevant tests and builds for the changes you make.\n- Do not commit, push, deploy, or delete worktrees.\n- Finish with a concise summary of changes and validation results.\n`;
+  return `You are executing backend job ${job.id} in an isolated run directory.\n\nSelected repositories (all and only the repositories you may access):\n${listing}\n\nProject repository candidates (bounded metadata only; these are not filesystem grants):\n${candidates}${prior}\n\nCurrent user request:\n${job.prompt}\n\nRules:\n- Do not read, write, or traverse outside ${runDirectory}.\n- Work only in the selected repository directories listed above.\n- Do not create or use subagents.\n- Run relevant tests and builds for the changes you make.\n- Do not commit, push, deploy, or delete worktrees.\n- If the task cannot be completed because repository scope is insufficient, do not claim completion or make speculative changes. Return a JSON object with type \"scope_required\", suggestedRepositoryIds, and reasons.\n- Finish with a concise summary of changes and validation results.\n`;
 }
 
 export async function prepareRepositories(job: Job, repositories: Repository[], workspaceRoot: string, runsRootOption: string, emit: AgentEventEmitter): Promise<{ runDirectory: string; prepared: PreparedRepository[] }> {
@@ -87,4 +88,15 @@ export async function collectChanges(prepared: PreparedRepository) {
   const changedFiles = new Set(files.stdout.trim() ? files.stdout.trim().split('\n') : []);
   for (const line of status.stdout.trimEnd().split('\n')) if (line) changedFiles.add(line.slice(3).replace(/^.* -> /, ''));
   return { repositoryId: prepared.repository.id, repositoryName: prepared.repository.name, directory: prepared.worktreePath, branch: prepared.branch, status: status.stdout.trim(), changedFiles: [...changedFiles], diffStat: stats.stdout.trim() };
+}
+
+export function parseScopeRequired(message: string): { suggestedRepositoryIds: string[]; reasons: Array<{ repositoryId: string; reason: string }> } | undefined {
+  const candidate = message.match(/\{[\s\S]*"type"\s*:\s*"scope_required"[\s\S]*\}/)?.[0];
+  if (!candidate) return undefined;
+  try {
+    const value = JSON.parse(candidate) as Record<string, unknown>;
+    if (!Array.isArray(value.suggestedRepositoryIds) || !value.suggestedRepositoryIds.every((id) => typeof id === 'string')) return undefined;
+    const reasons = Array.isArray(value.reasons) ? value.reasons.filter((reason): reason is { repositoryId: string; reason: string } => Boolean(reason) && typeof reason === 'object' && typeof (reason as any).repositoryId === 'string' && typeof (reason as any).reason === 'string') : [];
+    return { suggestedRepositoryIds: value.suggestedRepositoryIds as string[], reasons };
+  } catch { return undefined; }
 }

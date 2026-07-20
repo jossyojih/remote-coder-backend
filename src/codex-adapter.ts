@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { FastifyBaseLogger } from 'fastify';
 import type { AgentAdapter, AgentEventEmitter, Job, Repository } from './types.js';
-import { buildJobPrompt, childEnvironment, collectChanges, prepareRepositories, stopProcess } from './agent-runtime.js';
+import { buildJobPrompt, childEnvironment, collectChanges, parseScopeRequired, prepareRepositories, stopProcess } from './agent-runtime.js';
 
 export interface CodexAdapterOptions {
   codexBin: string;
@@ -97,7 +97,11 @@ export class CodexAgentAdapter implements AgentAdapter {
           emit(translated.type, translated.message, translated.data);
           if (event.type === 'turn.completed') {
             protocolCompleted = true;
-            if (latestAgentMessage) emit('final_response', latestAgentMessage.message, latestAgentMessage.data);
+            if (latestAgentMessage) {
+              const required = parseScopeRequired(latestAgentMessage.message);
+              if (required) emit('scope_required', 'Additional repository scope is required', required);
+              else emit('final_response', latestAgentMessage.message, latestAgentMessage.data);
+            }
           } else if (event.type === 'turn.failed' || event.type === 'error') {
             protocolError = new CodexProtocolError(translated.message);
           }

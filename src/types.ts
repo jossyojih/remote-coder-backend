@@ -46,6 +46,7 @@ export interface Job {
   repositoryResults?: Array<Record<string, unknown>>;
   error?: string;
   question?: string;
+  repositoryScopeCandidates?: Array<{ repositoryId: string; repositoryName: string; role: string }>;
 }
 
 export type AgentEventEmitter = (type: string, message: string, data?: unknown) => void;

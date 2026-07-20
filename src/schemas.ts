@@ -32,11 +32,26 @@ export const replySchema = z.object({
   message: z.string().trim().min(1).max(100_000),
 });
 
-export const scopeDecisionSchema = z.object({ decision: z.enum(['approve', 'reject']) });
+export const scopeDecisionSchema = z.object({
+  decision: z.enum(['approve', 'reject', 'choose']),
+  requestedRepositoryIds: z.array(z.string().uuid()).optional(),
+}).superRefine((value, context) => {
+  const ids = value.requestedRepositoryIds ?? [];
+  if (new Set(ids).size !== ids.length) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository IDs must be unique' });
+  if (value.decision === 'choose' && ids.length === 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Choose at least one repository' });
+  if (value.decision !== 'choose' && ids.length) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository selections require choose' });
+});
 
 export const followUpSchema = z.object({
   message: z.string().trim().min(1).max(100_000),
   requestId: z.string().uuid(),
+  scopeMode: z.enum(['auto', 'manual', 'all']).optional(),
+  requestedRepositoryIds: z.array(z.string().uuid()).optional(),
+}).superRefine((value, context) => {
+  const ids = value.requestedRepositoryIds ?? [];
+  if (new Set(ids).size !== ids.length) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository IDs must be unique' });
+  if (value.scopeMode === 'manual' && ids.length === 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Manual scope requires at least one repository' });
+  if (value.scopeMode !== 'manual' && ids.length > 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository selections require manual scope' });
 });
 
 export const promoteJobSchema = z.object({

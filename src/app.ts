@@ -153,11 +153,12 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     return reply.code(201).send(job);
   });
   app.post('/jobs/:id/scope-decision', async (request, reply) => {
-    const { id } = idParamsSchema.parse(request.params); const { decision } = scopeDecisionSchema.parse(request.body);
+    const { id } = idParamsSchema.parse(request.params); const { decision, requestedRepositoryIds } = scopeDecisionSchema.parse(request.body);
     if (!store.getJob(id)) return reply.code(404).send({ error: 'Job not found' });
-    const job = store.decideScope(id, decision === 'approve');
+    const job = store.decideScope(id, decision === 'approve', decision === 'choose' ? requestedRepositoryIds : undefined);
     if (!job) return reply.code(409).send({ error: 'Job is not waiting for a scope decision' });
-    bus.publish(store.addEvent(id, 'scope_decision', decision === 'approve' ? 'Scope expansion approved' : 'Keeping current repository scope', { decision, resolvedRepositoryIds: job.resolvedRepositoryIds }));
+    const decisionMessage = decision === 'approve' ? 'Suggested scope approved' : decision === 'choose' ? 'Repository scope corrected manually' : 'Keeping current repository scope';
+    bus.publish(store.addEvent(id, 'scope_decision', decisionMessage, { decision, resolvedRepositoryIds: job.resolvedRepositoryIds }));
     worker.wake(); return job;
   });
   app.get('/jobs', async (request) => {
@@ -178,16 +179,18 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const { id } = idParamsSchema.parse(request.params); const conversation = store.conversation(id);
     return conversation ?? reply.code(404).send({ error: 'Job not found' });
   });
-  app.post('/jobs/:id/follow-ups', async (request, reply) => {
+  const continueJob = async (request: any, reply: any) => {
     const { id } = idParamsSchema.parse(request.params); const input = followUpSchema.parse(request.body);
-    const result = store.createFollowUp(id, input.message, input.requestId);
+    const result = store.createFollowUp(id, input.message, input.requestId, input.scopeMode, input.requestedRepositoryIds);
     if (result.conflict === 'not_found') return reply.code(404).send({ error: 'Job not found' });
     if (result.conflict === 'parent_active') return reply.code(409).send({ error: 'Only terminal jobs can be continued' });
     if (result.conflict === 'not_latest') return reply.code(409).send({ error: 'Only the latest job in a conversation can be continued' });
     if (result.conflict === 'thread_active') return reply.code(409).send({ error: 'This conversation already has an active job' });
     if (result.conflict === 'scope_invalid') return reply.code(409).send({ error: 'The original repository scope is no longer valid' });
     worker.wake(); return reply.code(201).send(result.job);
-  });
+  };
+  app.post('/jobs/:id/follow-ups', continueJob);
+  app.post('/jobs/:id/continue', continueJob);
   app.post('/jobs/:id/cancel', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
     if (!store.getJob(id)) return reply.code(404).send({ error: 'Job not found' });

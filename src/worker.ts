@@ -59,6 +59,19 @@ export class JobWorker {
     this.bus.publish(this.store.addEvent(jobId, type, message, data));
   }
 
+  private scopeRequired(job: Job): boolean {
+    const event = this.store.events(job.id).filter((item) => item.type === 'scope_required').at(-1);
+    if (!event) return false;
+    const data = event.data as { suggestedRepositoryIds?: unknown; reasons?: unknown };
+    const suggested = Array.isArray(data?.suggestedRepositoryIds) ? data.suggestedRepositoryIds.filter((id): id is string => typeof id === 'string') : [];
+    if (!suggested.length || !this.store.repositoriesBelongTo(job.projectId, suggested)) throw new Error('Agent returned an invalid scope-required result');
+    const supplied = Array.isArray(data.reasons) ? data.reasons as import('./types.js').ScopeReason[] : [];
+    const reasons = suggested.map((repositoryId) => supplied.find((reason) => reason.repositoryId === repositoryId && typeof reason.reason === 'string' && reason.reason.trim()) ?? { repositoryId, reason: 'The selected scope was insufficient for the requested work.' });
+    this.store.proposeScope(job.id, suggested, reasons, 'awaiting_correction');
+    this.emit(job.id, 'status', 'Additional repository scope is required', { status: 'needs_input', suggestedRepositoryIds: suggested, reasons });
+    return true;
+  }
+
   private async tick() {
     if (this.stopping || this.active) return;
     const job = this.store.nextQueuedJob();
@@ -85,10 +98,13 @@ export class JobWorker {
         current = this.store.getJob(job.id)!;
         this.emit(job.id, 'scope_resolved', `Resolved repository scope to ${current.resolvedRepositoryIds.length} repository${current.resolvedRepositoryIds.length === 1 ? '' : 'ies'}`, { scopeMode: current.scopeMode, requestedRepositoryIds: current.requestedRepositoryIds, resolvedRepositoryIds: current.resolvedRepositoryIds, reasons: current.scopeReasons });
       }
+      const project = this.store.getProject(current.projectId); if (!project) throw new Error('Project no longer exists');
+      current = { ...current, repositoryScopeCandidates: project.repositories.map((repository) => ({ repositoryId: repository.id, repositoryName: repository.name, role: this.planner.describe(repository) })) };
       const repositories = this.store.repositories(current.resolvedRepositoryIds);
       if (repositories.length !== current.resolvedRepositoryIds.length || repositories.length === 0) throw new Error('Resolved repository scope is empty or invalid');
       const adapter = this.adapters[current.agent]; if (!adapter) throw new Error(`Agent ${current.agent} is not available`);
       await adapter.run(current, repositories, (type, message, data) => this.emit(job.id, type, message, data), controller.signal);
+      if (this.scopeRequired(current)) return;
       if (this.store.getJob(job.id)?.status === 'running') {
         this.store.setStatus(job.id, 'done');
         this.emit(job.id, 'status', 'Job completed', { status: 'done' });
