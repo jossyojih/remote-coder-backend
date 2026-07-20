@@ -33,7 +33,7 @@ export class JobWorker {
   private active?: { jobId: string; controller: AbortController };
   private stopping = false;
 
-  constructor(private store: Store, private bus: JobEventBus, private adapters: Partial<Record<'mock' | 'codex' | 'claude', AgentAdapter>>, private log: FastifyBaseLogger, private pollMs = 25, private planner = new RepositoryScopePlanner()) {}
+  constructor(private store: Store, private bus: JobEventBus, private adapters: Partial<Record<'mock' | 'codex' | 'claude', AgentAdapter>>, private log: FastifyBaseLogger, private pollMs = 25, private planner = new RepositoryScopePlanner(), private readonly onTerminal?: (jobId: string) => Promise<void>) {}
 
   start() { this.timer = setInterval(() => void this.tick(), this.pollMs); this.timer.unref(); void this.tick(); }
   wake() { void this.tick(); }
@@ -42,6 +42,7 @@ export class JobWorker {
     const job = this.store.getJob(jobId);
     if (!job || !['queued', 'running', 'needs_input'].includes(job.status)) return false;
     this.store.setStatus(jobId, 'cancelled');
+    void this.onTerminal?.(jobId);
     this.emit(jobId, 'status', 'Job cancelled', { status: 'cancelled' });
     if (this.active?.jobId === jobId) this.active.controller.abort(new Error('cancelled'));
     return true;
@@ -112,11 +113,13 @@ export class JobWorker {
       if (this.scopeRequired(current)) return;
       if (this.store.getJob(job.id)?.status === 'running') {
         this.store.setStatus(job.id, 'done');
+        await this.onTerminal?.(job.id);
         this.emit(job.id, 'status', 'Job completed', { status: 'done' });
       }
     } catch (error) {
       if (this.store.getJob(job.id)?.status !== 'cancelled' && !this.stopping) {
         this.store.setStatus(job.id, 'failed');
+        await this.onTerminal?.(job.id);
         this.emit(job.id, 'error', 'Job failed', { status: 'failed', error: error instanceof Error ? error.message : String(error) });
         this.log.error({ err: error, jobId: job.id }, 'worker job failed');
       }

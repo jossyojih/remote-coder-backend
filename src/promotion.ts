@@ -71,21 +71,27 @@ export class PromotionService {
         const deletions = raw.split('\n').filter((l) => l.startsWith('-') && !l.startsWith('---')).length;
         files.push({ path, additions, deletions, diff: diff.text, truncated: diff.truncated });
       }
-      repositories.push({ repositoryId: run.repositoryId, repositoryName: project.repositories.find((r) => r.id === run.repositoryId)!.name, baseCommitSha: run.baseCommitSha, targetBranch: run.targetBranch, changedFiles: files, additions: files.reduce((n, f) => n + f.additions, 0), deletions: files.reduce((n, f) => n + f.deletions, 0), hasChanges: files.length > 0 });
+      const repository = project.repositories.find((r) => r.id === run.repositoryId)!;
+      repositories.push({ repositoryId: run.repositoryId, repositoryName: repository.name, effectivePromotionPolicy: repository.effectivePromotionPolicy, baseCommitSha: run.baseCommitSha, targetBranch: run.targetBranch, changedFiles: files, additions: files.reduce((n, f) => n + f.additions, 0), deletions: files.reduce((n, f) => n + f.deletions, 0), hasChanges: files.length > 0 });
     }
     return { jobId, promotion: this.store.getPromotion(jobId), repositories, hasChanges: repositories.some((r) => r.hasChanges), limits: { totalDiffBytes: MAX_DIFF_BYTES, perFileDiffBytes: MAX_FILE_DIFF_BYTES } };
   }
 
-  async promote(jobId: string, message: string, approvedIds: string[]): Promise<Promotion> {
+  async promote(jobId: string, message: string, approvedIds: string[], automated = false): Promise<Promotion> {
     const review = await this.review(jobId); const changed = review.repositories.filter((r) => r.hasChanges).map((r) => r.repositoryId);
+    const repositories = this.store.repositories(approvedIds);
+    const allowedPolicy = automated ? 'auto_push' : 'review_required';
+    if (repositories.length !== approvedIds.length || repositories.some((repository) => repository.effectivePromotionPolicy !== allowedPolicy)) {
+      throw new PromotionConflictError(automated ? 'Only repositories with effective Auto-push policy can be auto-pushed' : 'Only repositories awaiting review can be promoted manually', 'policy_forbidden');
+    }
     const runs = this.store.repositoryRuns(jobId).filter((r) => approvedIds.includes(r.repositoryId));
     const previous = this.store.getPromotion(jobId);
     if (!previous && approvedIds.some((id) => !changed.includes(id))) throw new PromotionConflictError('Only changed repositories owned by this completed job may be approved', 'invalid_approval');
     const started = this.store.beginPromotion(jobId, message, runs);
     if (started.conflict) throw new PromotionConflictError('A promotion already exists with different approval details', started.conflict);
     const existing = started.promotion!;
-    const existingIds = existing.repositories.map((r) => r.repositoryId).sort();
-    if (existingIds.join() !== [...approvedIds].sort().join()) throw new PromotionConflictError('A promotion already exists with different approved repositories', 'approval_mismatch');
+    const existingIds = existing.repositories.map((r) => r.repositoryId);
+    if (approvedIds.some((id) => !existingIds.includes(id))) throw new PromotionConflictError('Approved repositories could not be added to the promotion', 'approval_mismatch');
     for (const run of runs) {
       const prior = existing.repositories.find((r) => r.repositoryId === run.repositoryId)!;
       if (prior.status !== 'promoted') await this.deployments?.assertAvailable(run);
@@ -119,6 +125,51 @@ export class PromotionService {
         this.store.setPromotionRepository(jobId, run.repositoryId, 'failed', { error: error instanceof Error ? error.message : String(error), conflict });
       }
     }
-    return this.store.getPromotion(jobId)!;
+    const completed = this.store.getPromotion(jobId)!;
+    for (const result of completed.repositories.filter((item) => approvedIds.includes(item.repositoryId))) this.store.addEvent(jobId, 'promotion_result', result.status === 'promoted' ? (automated ? 'Repository auto-pushed' : 'Repository promoted after review') : 'Repository promotion failed', { repositoryId: result.repositoryId, effectivePolicy: allowedPolicy, result: result.status === 'promoted' ? (automated ? 'auto_pushed' : 'pushed_after_review') : 'failed', commitSha: result.commitSha, error: result.error, conflict: result.conflict });
+    return completed;
+  }
+
+  async applyEffectivePolicies(jobId: string): Promise<void> {
+    const job = this.store.getJob(jobId); if (!job) return;
+    if (job.status !== 'done') {
+      for (const repository of this.store.repositories(job.resolvedRepositoryIds.length ? job.resolvedRepositoryIds : job.requestedRepositoryIds)) {
+        if (repository.effectivePromotionPolicy === 'read_only') {
+          const run = this.store.repositoryRuns(jobId).find((item) => item.repositoryId === repository.id);
+          if (run) try { await this.validateRun(run); await runCommand('git', ['reset', '--hard', run.baseCommitSha, '--'], run.worktreePath); await runCommand('git', ['clean', '-fd', '--'], run.worktreePath); }
+          catch (error) { this.store.addEvent(jobId, 'promotion_result', 'Failed to discard read-only changes', { repositoryId: repository.id, effectivePolicy: 'read_only', result: 'failed', error: error instanceof Error ? error.message : String(error) }); }
+        }
+        this.store.addEvent(jobId, 'promotion_policy', `Promotion skipped because job ${job.status}`, { repositoryId: repository.id, repositoryName: repository.name, effectivePolicy: repository.effectivePromotionPolicy, result: 'not_eligible', jobStatus: job.status });
+      }
+      return;
+    }
+    let review: Awaited<ReturnType<PromotionService['review']>>;
+    try { review = await this.review(jobId); }
+    catch (error) {
+      for (const repository of this.store.repositories(job.resolvedRepositoryIds)) this.store.addEvent(jobId, 'promotion_policy', 'Promotion policy evaluation failed', { repositoryId: repository.id, effectivePolicy: repository.effectivePromotionPolicy, result: 'failed', error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    const autoIds: string[] = [];
+    for (const result of review.repositories) {
+      const repository = this.store.repositories([result.repositoryId])[0]!;
+      const outcome = !result.hasChanges ? 'no_changes' : repository.effectivePromotionPolicy === 'auto_push' ? 'auto_push_pending' : repository.effectivePromotionPolicy === 'read_only' ? 'read_only' : 'awaiting_review';
+      this.store.addEvent(jobId, 'promotion_policy', `Promotion policy: ${outcome.replaceAll('_', ' ')}`, { repositoryId: repository.id, repositoryName: repository.name, effectivePolicy: repository.effectivePromotionPolicy, result: outcome });
+      if (result.hasChanges && repository.effectivePromotionPolicy === 'auto_push') autoIds.push(repository.id);
+      if (repository.effectivePromotionPolicy === 'read_only' && result.hasChanges) {
+        const run = this.store.repositoryRuns(jobId).find((item) => item.repositoryId === repository.id)!;
+        try {
+          await this.validateRun(run);
+          await runCommand('git', ['reset', '--hard', run.baseCommitSha, '--'], run.worktreePath);
+          await runCommand('git', ['clean', '-fd', '--'], run.worktreePath);
+          this.store.addEvent(jobId, 'promotion_result', 'Read-only changes discarded', { repositoryId: repository.id, effectivePolicy: 'read_only', result: 'read_only' });
+        } catch (error) { this.store.addEvent(jobId, 'promotion_result', 'Failed to discard read-only changes', { repositoryId: repository.id, effectivePolicy: 'read_only', result: 'failed', error: error instanceof Error ? error.message : String(error) }); }
+      }
+    }
+    if (!autoIds.length) return;
+    try {
+      await this.promote(jobId, `Remote Coder automatic changes for job ${jobId}`, autoIds, true);
+    } catch (error) {
+      for (const repositoryId of autoIds) this.store.addEvent(jobId, 'promotion_result', 'Repository auto-push failed', { repositoryId, effectivePolicy: 'auto_push', result: 'failed', error: error instanceof Error ? error.message : String(error) });
+    }
   }
 }

@@ -6,7 +6,7 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema } from './schemas.js';
+import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, updateProjectPromotionPolicySchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
 import { PromotionConflictError, PromotionService } from './promotion.js';
@@ -96,7 +96,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
       log: app.log,
     }),
-  }, app.log);
+  }, app.log, 25, undefined, (jobId) => promotion.applyEffectivePolicies(jobId));
 
   app.addHook('onRequest', async (request, reply) => {
     const origin = request.headers.origin;
@@ -106,7 +106,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     }
     if (request.method === 'OPTIONS') {
       if (!origin) return reply.code(400).send({ error: 'Origin required' });
-      reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS').header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Last-Event-ID').header('Access-Control-Max-Age', '600');
+      reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS').header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Last-Event-ID').header('Access-Control-Max-Age', '600');
       return reply.code(204).send();
     }
     if (request.url === '/health' || request.url === '/auth/login') return;
@@ -149,6 +149,18 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.get('/projects/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const project = store.getProject(id);
     return project ?? reply.code(404).send({ error: 'Project not found' });
+  });
+  app.get('/projects/:id/promotion-policy', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const project = store.getProject(id);
+    return project ? { projectId: id, promotionPolicy: project.promotionPolicy, repositories: project.repositories.map(({ id: repositoryId, name, promotionPolicyOverride, effectivePromotionPolicy }) => ({ repositoryId, name, promotionPolicyOverride: promotionPolicyOverride ?? null, effectivePromotionPolicy })) } : reply.code(404).send({ error: 'Project not found' });
+  });
+  app.put('/projects/:id/promotion-policy', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const { promotionPolicy } = updateProjectPromotionPolicySchema.parse(request.body);
+    const project = store.updateProjectPromotionPolicy(id, promotionPolicy); return project ?? reply.code(404).send({ error: 'Project not found' });
+  });
+  app.put('/projects/:id/repositories/:repositoryId/promotion-policy', async (request, reply) => {
+    const { id, repositoryId } = projectRepositoryParamsSchema.parse(request.params); const { promotionPolicyOverride } = updateRepositoryPromotionPolicySchema.parse(request.body);
+    const project = store.updateRepositoryPromotionPolicy(id, repositoryId, promotionPolicyOverride); return project ?? reply.code(404).send({ error: 'Project or repository not found' });
   });
 
   app.post('/jobs', async (request, reply) => {

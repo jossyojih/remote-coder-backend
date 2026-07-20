@@ -1,10 +1,10 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
+import type { Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
 
-type ProjectRow = { id: string; name: string; created_at: string };
-type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; created_at: string };
+type ProjectRow = { id: string; name: string; created_at: string; promotion_policy: PromotionPolicy };
+type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; promotion_policy_override?: PromotionPolicy | null; created_at: string };
 type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex' | 'claude'; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
@@ -73,6 +73,9 @@ export class Store {
     const repositoryColumns = this.db.prepare('PRAGMA table_info(repositories)').all() as unknown as Array<{ name: string }>;
     if (!repositoryColumns.some((column) => column.name === 'remote_name')) this.db.exec("ALTER TABLE repositories ADD COLUMN remote_name TEXT NOT NULL DEFAULT 'origin'");
     if (!repositoryColumns.some((column) => column.name === 'target_branch')) this.db.exec('ALTER TABLE repositories ADD COLUMN target_branch TEXT');
+    if (!repositoryColumns.some((column) => column.name === 'promotion_policy_override')) this.db.exec("ALTER TABLE repositories ADD COLUMN promotion_policy_override TEXT CHECK(promotion_policy_override IN ('review_required','auto_push','read_only'))");
+    const projectColumns = this.db.prepare('PRAGMA table_info(projects)').all() as unknown as Array<{ name: string }>;
+    if (!projectColumns.some((column) => column.name === 'promotion_policy')) this.db.exec("ALTER TABLE projects ADD COLUMN promotion_policy TEXT NOT NULL DEFAULT 'review_required' CHECK(promotion_policy IN ('review_required','auto_push','read_only'))");
     const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>;
     if (!jobColumns.some((column) => column.name === 'agent')) {
       this.db.exec("ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'mock'");
@@ -125,7 +128,7 @@ export class Store {
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('INSERT INTO projects VALUES (?, ?, ?)').run(id, name, now);
+      this.db.prepare('INSERT INTO projects(id,name,created_at,promotion_policy) VALUES (?, ?, ?, ?)').run(id, name, now, 'review_required');
       const insert = this.db.prepare('INSERT INTO repositories(id,project_id,name,path,created_at,remote_name,target_branch) VALUES (?, ?, ?, ?, ?, ?, ?)');
       for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now, repo.remoteName ?? 'origin', repo.targetBranch ?? null);
       this.db.exec('COMMIT');
@@ -145,10 +148,23 @@ export class Store {
 
   private mapProject(row: ProjectRow): Project {
     const repos = this.db.prepare('SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, name').all(row.id) as unknown as RepoRow[];
-    return { id: row.id, name: row.name, createdAt: row.created_at, repositories: repos.map(this.mapRepo) };
+    return { id: row.id, name: row.name, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required')) };
   }
 
-  private mapRepo = (row: RepoRow): Repository => ({ id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at, remoteName: row.remote_name ?? 'origin', targetBranch: row.target_branch ?? undefined });
+  private mapRepo = (row: RepoRow, projectPolicy?: PromotionPolicy): Repository => {
+    const fallback = projectPolicy ?? (this.db.prepare('SELECT promotion_policy FROM projects WHERE id=?').get(row.project_id) as { promotion_policy: PromotionPolicy } | undefined)?.promotion_policy ?? 'review_required';
+    return { id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at, remoteName: row.remote_name ?? 'origin', targetBranch: row.target_branch ?? undefined, promotionPolicyOverride: row.promotion_policy_override ?? undefined, effectivePromotionPolicy: row.promotion_policy_override ?? fallback };
+  };
+
+  updateProjectPromotionPolicy(id: string, policy: PromotionPolicy): Project | undefined {
+    const result = this.db.prepare('UPDATE projects SET promotion_policy=? WHERE id=?').run(policy, id);
+    return Number(result.changes) ? this.getProject(id) : undefined;
+  }
+
+  updateRepositoryPromotionPolicy(projectId: string, repositoryId: string, policy: PromotionPolicy | null): Project | undefined {
+    const result = this.db.prepare('UPDATE repositories SET promotion_policy_override=? WHERE id=? AND project_id=?').run(policy, repositoryId, projectId);
+    return Number(result.changes) ? this.getProject(projectId) : undefined;
+  }
 
   repositoriesBelongTo(projectId: string, ids: string[]): boolean {
     const placeholders = ids.map(() => '?').join(',');
@@ -347,8 +363,10 @@ export class Store {
   beginPromotion(jobId: string, message: string, runs: JobRepositoryRun[]): { promotion?: Promotion; conflict?: string } {
     const existing = this.getPromotion(jobId);
     if (existing) {
-      if (existing.commitMessage !== message) return { conflict: 'message_mismatch' };
-      return { promotion: existing };
+      const now = new Date().toISOString();
+      const insert = this.db.prepare("INSERT OR IGNORE INTO promotion_repositories(promotion_id,repository_id,status,target_branch,updated_at) VALUES (?,?,'pending',?,?)");
+      for (const run of runs) insert.run(existing.id, run.repositoryId, run.targetBranch, now);
+      return { promotion: this.getPromotion(jobId)! };
     }
     const id = crypto.randomUUID(); const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');

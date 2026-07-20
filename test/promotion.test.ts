@@ -92,3 +92,31 @@ test('does not promote no-change jobs and rejects injection-shaped inputs', asyn
   const injected = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'safe\0bad', approvedRepositoryIds: [f.project.repositories[0].id] } }); assert.equal(injected.statusCode, 400);
   const pathAttempt = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'x', approvedRepositoryIds: ['../../repo'] } }); assert.equal(pathAttempt.statusCode, 400);
 });
+
+test('policy APIs default safely, support repository overrides, and backend blocks policy bypass', async () => {
+  const f = await setup(2);
+  assert.equal(f.project.promotionPolicy, 'review_required');
+  assert.ok(f.project.repositories.every((repository: { effectivePromotionPolicy: string }) => repository.effectivePromotionPolicy === 'review_required'));
+  const projectUpdate = await f.app.inject({ method: 'PUT', url: `/projects/${f.project.id}/promotion-policy`, headers: auth, payload: { promotionPolicy: 'auto_push' } });
+  assert.equal(projectUpdate.statusCode, 200); assert.ok(projectUpdate.json().repositories.every((repository: { effectivePromotionPolicy: string }) => repository.effectivePromotionPolicy === 'auto_push'));
+  const override = await f.app.inject({ method: 'PUT', url: `/projects/${f.project.id}/repositories/${f.project.repositories[1].id}/promotion-policy`, headers: auth, payload: { promotionPolicyOverride: 'read_only' } });
+  assert.equal(override.statusCode, 200); assert.equal(override.json().repositories[1].effectivePromotionPolicy, 'read_only');
+  appendFileSync(join(f.prepared[0].worktreePath, 'README.md'), 'change\n');
+  const bypass = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'Bypass', approvedRepositoryIds: [f.project.repositories[0].id] } });
+  assert.equal(bypass.statusCode, 409); assert.equal(bypass.json().code, 'policy_forbidden');
+  assert.equal((await f.app.inject({ method: 'PUT', url: `/projects/${f.project.id}/promotion-policy`, payload: { promotionPolicy: 'read_only' } })).statusCode, 401);
+});
+
+test('mixed effective policies auto-push only validated auto repositories and audit every repository', async () => {
+  const f = await setup(3, 0);
+  await f.app.inject({ method: 'PUT', url: `/projects/${f.project.id}/repositories/${f.project.repositories[0].id}/promotion-policy`, headers: auth, payload: { promotionPolicyOverride: 'auto_push' } });
+  await f.app.inject({ method: 'PUT', url: `/projects/${f.project.id}/repositories/${f.project.repositories[2].id}/promotion-policy`, headers: auth, payload: { promotionPolicyOverride: 'read_only' } });
+  for (const repo of f.prepared) appendFileSync(join(repo.worktreePath, 'README.md'), 'policy change\n');
+  const service = new (await import('../src/promotion.js')).PromotionService(f.store, f.root, f.runsRoot, new (await import('../src/deployment.js')).DeploymentCoordinator(f.store, f.repositories[0].source, async (id) => { f.starts.push(id); }));
+  await service.applyEffectivePolicies(f.jobId);
+  const review = await service.review(f.jobId); const auto = f.store.getPromotion(f.jobId)!;
+  assert.equal(auto.repositories.length, 1); assert.equal(auto.repositories[0].repositoryId, f.project.repositories[0].id); assert.equal(auto.repositories[0].status, 'promoted');
+  assert.equal(review.repositories[1].hasChanges, true); assert.equal(review.repositories[2].hasChanges, false);
+  const audits = f.store.events(f.jobId).filter((event) => event.type === 'promotion_policy').slice(-3); assert.deepEqual(new Set(audits.map((event) => (event.data as { repositoryId: string }).repositoryId)), new Set(f.project.repositories.map((repository: { id: string }) => repository.id)));
+  assert.equal(f.starts.length, 1);
+});

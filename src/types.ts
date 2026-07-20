@@ -5,12 +5,15 @@ export const JOB_STATUSES = [
 export type JobStatus = (typeof JOB_STATUSES)[number];
 export const SCOPE_MODES = ['auto', 'manual', 'all'] as const;
 export type ScopeMode = (typeof SCOPE_MODES)[number];
+export const PROMOTION_POLICIES = ['review_required', 'auto_push', 'read_only'] as const;
+export type PromotionPolicy = (typeof PROMOTION_POLICIES)[number];
 export interface ScopeReason { repositoryId: string; reason: string }
 
 export interface Project {
   id: string;
   name: string;
   createdAt: string;
+  promotionPolicy: PromotionPolicy;
   repositories: Repository[];
 }
 
@@ -22,6 +25,8 @@ export interface Repository {
   createdAt: string;
   remoteName?: string;
   targetBranch?: string;
+  promotionPolicyOverride?: PromotionPolicy;
+  effectivePromotionPolicy: PromotionPolicy;
 }
 
 export interface Job {

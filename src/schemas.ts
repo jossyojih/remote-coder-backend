@@ -1,6 +1,10 @@
 import { z } from 'zod';
 
 export const idParamsSchema = z.object({ id: z.string().uuid() });
+export const projectRepositoryParamsSchema = z.object({ id: z.string().uuid(), repositoryId: z.string().uuid() });
+export const promotionPolicySchema = z.enum(['review_required', 'auto_push', 'read_only']);
+export const updateProjectPromotionPolicySchema = z.object({ promotionPolicy: promotionPolicySchema });
+export const updateRepositoryPromotionPolicySchema = z.object({ promotionPolicyOverride: promotionPolicySchema.nullable() });
 
 export const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(200),
