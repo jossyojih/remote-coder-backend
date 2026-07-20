@@ -6,4 +6,5 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 .env
+.env.auth
 coverage/

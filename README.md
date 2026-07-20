@@ -18,11 +18,19 @@ Environment variables are not loaded automatically; export them in your shell or
 
 Generate the browser password hash and a 256-bit session secret locally. The command reads the password from hidden terminal input (or standard input for automation); it does not accept plaintext in command-line arguments or environment variables:
 
+The generated values are single-quoted so the `$` characters in `APP_PASSWORD_HASH` remain literal in a POSIX-style `.env` file and when the file is loaded by a shell. To avoid displaying or logging the values, write them directly to a new private file (the `--silent` flag also keeps npm's status text out of that file), then load it alongside the rest of the service configuration:
+
 ```bash
-npm run generate:auth
+umask 077
+npm run --silent generate:auth > .env.auth
+set -a
+. ./.env.auth
+set +a
 ```
 
-Copy the two output assignments directly into the EC2 service's secret environment configuration. Do not save the plaintext password, generator output, runner token, or issued access tokens in source control, logs, browser persistent storage, or analytics. Set `APP_ORIGINS` to an exact comma-separated allowlist such as `https://your-pwa.onrender.com,http://localhost:3000`; entries must include the scheme and port where applicable and must not contain paths or wildcards. `APP_TOKEN_TTL_SECONDS` defaults to 900 seconds.
+Keep `.env.auth` outside source control and restrict it to the service account. Copy the quoted assignments directly into the EC2 service's secret environment configuration if that is how the service is configured. Do not save the plaintext password, generator output, runner token, or issued access tokens in source control, logs, browser persistent storage, or analytics. Set `APP_ORIGINS` to an exact comma-separated allowlist such as `https://your-pwa.onrender.com,http://localhost:3000`; entries must include the scheme and port where applicable and must not contain paths or wildcards. `APP_TOKEN_TTL_SECONDS` defaults to 900 seconds.
+
+For an intentional one-year remembered-device login, set `APP_TOKEN_TTL_SECONDS=31536000` before starting the service. This makes every newly issued bearer token valid for up to one year; remembering it across browser restarts also requires the client to store it persistently. That substantially increases the impact of a stolen device, browser-storage compromise, XSS, or leaked token, so use the 900-second default when persistent login is not required and protect remembered devices appropriately. There is no per-token server-side revocation list. To reset the app password and invalidate all existing app tokens, stop the service, run the generator again, replace both `APP_PASSWORD_HASH` and `APP_SESSION_SECRET` in the secret configuration, and restart the service. Rotating only the password hash does not revoke tokens already issued with the old session secret.
 
 The PWA calls `POST /auth/login` with `{ "password": "..." }`, keeps the returned `accessToken` in memory, and sends `Authorization: Bearer <accessToken>` on API and SSE requests. The response also includes an ISO-8601 `expiresAt`; log in again after expiry. No cookie is issued. Login attempts are limited in memory per client IP (five attempts per minute by default), which is suitable for this single-instance V1 but is not a distributed limiter.
 

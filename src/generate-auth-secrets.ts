@@ -1,7 +1,6 @@
-import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
-import { hashPassword } from './auth.js';
+import { generateAuthSecretAssignments } from './auth-secret-config.js';
 
 async function readPassword(): Promise<string> {
   if (!stdin.isTTY) {
@@ -23,5 +22,4 @@ async function readPassword(): Promise<string> {
 }
 
 const password = await readPassword();
-if (password.length < 12) throw new Error('Use an app password of at least 12 characters');
-stdout.write(`APP_PASSWORD_HASH=${await hashPassword(password)}\nAPP_SESSION_SECRET=${randomBytes(32).toString('base64url')}\n`);
+stdout.write(await generateAuthSecretAssignments(password));
