@@ -88,8 +88,14 @@ export class JobWorker {
         if (job.scopeMode === 'manual') {
           const additional = plan.repositoryIds.filter((id) => !job.requestedRepositoryIds.includes(id));
           if (additional.length) {
-            this.store.proposeScope(job.id, additional, plan.reasons);
-            this.emit(job.id, 'scope_proposal', 'Additional repository access is required', { status: 'needs_input', requestedRepositoryIds: job.requestedRepositoryIds, proposedRepositoryIds: additional, reasons: plan.reasons });
+            const selectedReasons = job.requestedRepositoryIds.map((repositoryId) => plan.reasons.find((reason) => reason.repositoryId === repositoryId) ?? { repositoryId, reason: 'Explicitly selected for manual scope.' });
+            const proposedReasons = additional.map((repositoryId) => plan.reasons.find((reason) => reason.repositoryId === repositoryId) ?? { repositoryId, reason: 'Additional repository access is required for the requested work.' });
+            // Persist the user's manual selection as the resolved scope before
+            // presenting planner suggestions. Suggestions remain separate and
+            // cannot enter the execution scope until a scope decision approves them.
+            this.store.resolveScope(job.id, job.requestedRepositoryIds, selectedReasons, 'pending');
+            this.store.proposeScope(job.id, additional, proposedReasons);
+            this.emit(job.id, 'scope_proposal', 'Additional repository access is required', { status: 'needs_input', requestedRepositoryIds: job.requestedRepositoryIds, resolvedRepositoryIds: job.requestedRepositoryIds, proposedRepositoryIds: additional, reasons: proposedReasons });
             return;
           }
           const reasons = job.requestedRepositoryIds.map((repositoryId) => plan.reasons.find((reason) => reason.repositoryId === repositoryId) ?? { repositoryId, reason: 'Explicitly selected for manual scope.' });

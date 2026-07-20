@@ -50,12 +50,17 @@ export async function prepareRepositories(job: Job, repositories: Repository[], 
   const configuredRunsRoot = isAbsolute(runsRootOption) ? runsRootOption : join(process.cwd(), runsRootOption);
   await mkdir(configuredRunsRoot, { recursive: true });
   const runsRoot = await realpath(configuredRunsRoot);
-  const requestedRunDirectory = join(runsRoot, job.id);
+  // A job can be re-queued after a reply or transient failure. Keep the job ID as
+  // the conversation/run grouping, but give every execution attempt immutable Git
+  // and filesystem identities. Never reuse or remove an older attempt: it may
+  // still belong to a process that has not finished shutting down.
+  const attemptId = crypto.randomUUID();
+  const requestedRunDirectory = join(runsRoot, job.id, attemptId);
   await mkdir(requestedRunDirectory, { recursive: true });
   const runDirectory = await realpath(requestedRunDirectory);
   const runRel = relative(runsRoot, runDirectory);
   if (runRel.startsWith('..') || isAbsolute(runRel)) throw new Error('Job run directory escapes RUNS_ROOT');
-  const branch = `remote-engineer/${job.id}`;
+  const branch = `remote-engineer/${job.id}/${attemptId}`;
   const prepared: PreparedRepository[] = [];
   for (const [index, repository] of repositories.entries()) {
     const sourcePath = await realpath(repository.path);

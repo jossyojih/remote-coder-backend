@@ -95,8 +95,25 @@ test('multi-repository execution creates isolated worktrees and collects changes
   const { app, store, project, root, repoA, repoB } = await fixture(); const job = await createJob(app, project, 'CHANGE_FILES', 2);
   assert.equal((await terminal(store, job.id)).status, 'done');
   const results = store.events(job.id).filter((event: any) => event.type === 'repository_result'); assert.equal(results.length, 2);
-  for (const result of results) { assert.equal(result.data.branch, `remote-engineer/${job.id}`); assert.deepEqual(result.data.changedFiles, ['README.md']); assert.match(result.data.diffStat, /README.md/); assert.ok(result.data.directory.startsWith(join(root, 'runs', job.id))); }
+  const branches = new Set(results.map((result: any) => result.data.branch));
+  assert.equal(branches.size, 1);
+  for (const result of results) { assert.match(result.data.branch, new RegExp(`^remote-engineer/${job.id}/[0-9a-f-]{36}$`)); assert.deepEqual(result.data.changedFiles, ['README.md']); assert.match(result.data.diffStat, /README.md/); assert.ok(result.data.directory.startsWith(join(root, 'runs', job.id))); }
   assert.equal(readFileSync(join(repoA, 'README.md'), 'utf8'), 'repo-a\n'); assert.equal(readFileSync(join(repoB, 'README.md'), 'utf8'), 'repo-b\n');
+});
+
+test('retrying the same job creates a new attempt without disturbing the retained worktree', async () => {
+  const { app, store, project } = await fixture(); const job = await createJob(app, project, 'Do the work');
+  assert.equal((await terminal(store, job.id)).status, 'done');
+  const first = store.repositoryRuns(job.id)[0];
+  // Exercise the same-job retry path used after an agent asks for input.
+  store.setStatus(job.id, 'needs_input');
+  const reply = await app.inject({ method: 'POST', url: `/jobs/${job.id}/reply`, headers: auth, payload: { message: 'retry' } });
+  assert.equal(reply.statusCode, 200);
+  assert.equal((await terminal(store, job.id)).status, 'done');
+  const second = store.repositoryRuns(job.id)[0];
+  assert.notEqual(second.branch, first.branch);
+  assert.notEqual(second.worktreePath, first.worktreePath);
+  assert.equal(git(first.worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']), first.branch);
 });
 
 test('invalid JSONL is stored as an error event without failing a successful run', async () => {

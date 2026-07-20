@@ -78,7 +78,8 @@ test('manual expansion requires explicit approval or rejection', async () => {
     const created = (await app.inject({ method: 'POST', url: '/jobs', headers, payload: { projectId: project.id, prompt: 'Change the backend API', scopeMode: 'manual', requestedRepositoryIds: [frontend.id], agent: 'mock' } })).json();
     const waiting = await waitFor(app, created.id, ['needs_input']);
     assert.deepEqual(waiting.proposedRepositoryIds, [backend.id]);
-    assert.deepEqual(waiting.resolvedRepositoryIds, []);
+    assert.deepEqual(waiting.resolvedRepositoryIds, [frontend.id]);
+    assert.deepEqual(waiting.selectedRepositoryIds, [frontend.id]);
     const response = await app.inject({ method: 'POST', url: `/jobs/${created.id}/scope-decision`, headers, payload: { decision } });
     assert.equal(response.statusCode, 200);
     const done = await waitFor(app, created.id, ['done']);

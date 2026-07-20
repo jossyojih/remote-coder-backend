@@ -40,7 +40,7 @@ Real Codex jobs use `CODEX_BIN` (default `codex`) and create persistent per-job 
 
 Real Claude jobs use `CLAUDE_BIN` (default `claude`) and `CLAUDE_MODEL` (default `sonnet`). Claude runs non-interactively with `stream-json`, no session persistence, no MCP servers, and an explicit built-in tool list. Its permission mode is `dontAsk`: explicitly allowed work tools can run unattended, while permission checks are not globally bypassed. This is less permissive than `bypassPermissions`/`--dangerously-skip-permissions`; the trade-off is that operations outside the allowlist fail instead of prompting. `Bash` remains powerful, so Claude is additionally constrained by explicit repository paths, retained per-job worktrees, a restricted environment, and the job prompt boundary. Run the service itself in an OS sandbox if hostile prompts are in scope.
 
-The service does not commit, push, clean, or remove worktrees. Each selected repository gets its own worktree and a `remote-engineer/<job-id>` branch. Operators are responsible for reviewing and eventually cleaning retained runs.
+The service does not commit, push, clean, or remove worktrees. Each execution attempt gets an immutable directory below `<job-id>/<attempt-id>`; every selected repository gets its own worktree on a `remote-engineer/<job-id>/<attempt-id>` branch. Retries therefore leave stale or still-active attempts untouched. Operators are responsible for reviewing and eventually cleaning retained runs.
 
 ## API
 

@@ -135,6 +135,10 @@ test('manual scope decision accepts only repositories in the job project', async
   const { app, root } = await fixture(500); const p = await project(app, root); const other = await project(app, root, 'Other');
   const created = (await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: p.id, prompt: 'Change repo-b', scopeMode: 'manual', requestedRepositoryIds: [p.repositories[0].id] } })).json();
   for (let attempt = 0; attempt < 100 && (await app.inject({ url: `/jobs/${created.id}`, headers: auth })).json().status !== 'needs_input'; attempt++) await new Promise((resolve) => setTimeout(resolve, 5));
+  const proposed = (await app.inject({ url: `/jobs/${created.id}`, headers: auth })).json();
+  assert.deepEqual(proposed.resolvedRepositoryIds, [p.repositories[0].id]);
+  assert.deepEqual(proposed.selectedRepositoryIds, [p.repositories[0].id]);
+  assert.deepEqual(proposed.proposedRepositoryIds, [p.repositories[1].id]);
   const outside = await app.inject({ method: 'POST', url: `/jobs/${created.id}/scope-decision`, headers: auth, payload: { decision: 'choose', requestedRepositoryIds: [other.repositories[0].id] } });
   assert.equal(outside.statusCode, 409);
   const chosen = await app.inject({ method: 'POST', url: `/jobs/${created.id}/scope-decision`, headers: auth, payload: { decision: 'choose', requestedRepositoryIds: [p.repositories[1].id] } });
