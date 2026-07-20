@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -45,6 +45,26 @@ test('promotes safely, returns commit metadata, and is idempotent', async () => 
   const first = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(first.statusCode, 200, first.body);
   const result = first.json(); assert.equal(result.status, 'promoted'); assert.match(result.repositories[0].commitSha, /^[a-f0-9]{40}$/); assert.equal(result.repositories[0].targetBranch, 'main');
   const second = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload }); assert.equal(second.statusCode, 200); assert.equal(second.json().repositories[0].commitSha, result.repositories[0].commitSha);
+});
+
+test('promotion summaries persist modified, added, and deleted file statistics', async () => {
+  const f = await setup(); const worktree = f.prepared[0].worktreePath;
+  writeFileSync(join(worktree, 'deleted.txt'), 'remove me\n');
+  await runCommand('git', ['add', 'deleted.txt'], worktree);
+  await runCommand('git', ['commit', '--no-gpg-sign', '-m', 'test fixture'], worktree);
+  await runCommand('git', ['push', 'origin', 'HEAD:main'], worktree);
+  const fixtureCommit = (await runCommand('git', ['rev-parse', 'HEAD'], worktree)).stdout.trim();
+  f.store.db.prepare('UPDATE job_repository_runs SET base_commit_sha=? WHERE job_id=? AND repository_id=?').run(fixtureCommit, f.jobId, f.project.repositories[0].id);
+  writeFileSync(join(worktree, 'README.md'), 'updated\nsecond line\n');
+  writeFileSync(join(worktree, 'added.txt'), 'first\nsecond\n');
+  rmSync(join(worktree, 'deleted.txt'));
+
+  const response = await f.app.inject({ method: 'POST', url: `/jobs/${f.jobId}/promotions`, headers: auth, payload: { commitMessage: 'Mixed file changes', approvedRepositoryIds: [f.project.repositories[0].id] } });
+  assert.equal(response.statusCode, 200, response.body);
+  const summary = response.json().repositories[0];
+  assert.deepEqual({ additions: summary.additions, deletions: summary.deletions, changedFiles: summary.changedFiles }, { additions: 4, deletions: 2, changedFiles: 3 });
+  const changes = (await f.app.inject({ url: `/jobs/${f.jobId}/changes`, headers: auth })).json();
+  assert.deepEqual({ additions: changes.promotion.repositories[0].additions, deletions: changes.promotion.repositories[0].deletions, changedFiles: changes.promotion.repositories[0].changedFiles }, { additions: 4, deletions: 2, changedFiles: 3 });
 });
 
 test('queues one exact-commit backend deployment and exposes only sanitized authenticated status', async () => {

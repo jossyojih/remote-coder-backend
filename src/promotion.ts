@@ -32,6 +32,19 @@ function bounded(value: string, max: number): { text: string; truncated: boolean
   return { text: `${text}\n… diff truncated …\n`, truncated: true };
 }
 
+async function diffStats(worktree: string, args: string[]): Promise<{ additions: number; deletions: number; changedFiles: number }> {
+  const [numstat, names] = await Promise.all([
+    runCommand('git', ['diff', '--numstat', '-z', ...args, '--'], worktree),
+    runCommand('git', ['diff', '--name-only', '-z', ...args, '--'], worktree),
+  ]);
+  let additions = 0; let deletions = 0;
+  for (const entry of numstat.stdout.split('\0')) {
+    const match = /^(\d+|-)\t(\d+|-)\t/.exec(entry);
+    if (match) { additions += match[1] === '-' ? 0 : Number(match[1]); deletions += match[2] === '-' ? 0 : Number(match[2]); }
+  }
+  return { additions, deletions, changedFiles: names.stdout.split('\0').filter(Boolean).length };
+}
+
 export class PromotionService {
   constructor(private readonly store: Store, private readonly workspaceRoot: string, private readonly runsRoot: string, private readonly deployments?: DeploymentCoordinator) {}
 
@@ -107,6 +120,7 @@ export class PromotionService {
         if (remoteSha !== run.baseCommitSha) throw new PromotionConflictError(`Remote ${run.targetBranch} advanced after this job started; start a new job from the latest remote commit`, 'stale_remote');
         const headBefore = (await runCommand('git', ['rev-parse', 'HEAD'], run.worktreePath)).stdout.trim();
         if (headBefore !== run.baseCommitSha) {
+          this.store.setPromotionRepositoryStats(jobId, run.repositoryId, await diffStats(run.worktreePath, [run.baseCommitSha, headBefore]));
           await runCommand('git', ['merge-base', '--is-ancestor', run.baseCommitSha, headBefore], run.worktreePath);
           await runCommand('git', ['push', run.remoteName, `HEAD:refs/heads/${run.targetBranch}`], run.worktreePath);
           this.store.setPromotionRepository(jobId, run.repositoryId, 'promoted', { commitSha: headBefore }); await this.deployments?.enqueue(jobId, run, headBefore); continue;
@@ -116,6 +130,7 @@ export class PromotionService {
           if (error instanceof Error && error.message.includes('failed (1)')) return true; throw error;
         }));
         if (!staged) { this.store.setPromotionRepository(jobId, run.repositoryId, 'promoted', { commitSha: run.baseCommitSha }); continue; }
+        this.store.setPromotionRepositoryStats(jobId, run.repositoryId, await diffStats(run.worktreePath, ['--cached']));
         await runCommand('git', ['commit', '--no-gpg-sign', '-m', message, '--'], run.worktreePath);
         const commitSha = (await runCommand('git', ['rev-parse', 'HEAD'], run.worktreePath)).stdout.trim();
         await runCommand('git', ['push', run.remoteName, `HEAD:refs/heads/${run.targetBranch}`], run.worktreePath);

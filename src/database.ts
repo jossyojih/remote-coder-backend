@@ -57,6 +57,7 @@ export class Store {
         promotion_id TEXT NOT NULL REFERENCES promotions(id) ON DELETE CASCADE, repository_id TEXT NOT NULL REFERENCES repositories(id),
         status TEXT NOT NULL CHECK(status IN ('pending','promoting','promoted','failed')), commit_sha TEXT,
         target_branch TEXT NOT NULL, error TEXT, conflict INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+        additions INTEGER, deletions INTEGER, changed_files INTEGER,
         PRIMARY KEY(promotion_id, repository_id)
       );
       CREATE TABLE IF NOT EXISTS deployments (
@@ -76,6 +77,10 @@ export class Store {
     if (!repositoryColumns.some((column) => column.name === 'promotion_policy_override')) this.db.exec("ALTER TABLE repositories ADD COLUMN promotion_policy_override TEXT CHECK(promotion_policy_override IN ('review_required','auto_push','read_only'))");
     const projectColumns = this.db.prepare('PRAGMA table_info(projects)').all() as unknown as Array<{ name: string }>;
     if (!projectColumns.some((column) => column.name === 'promotion_policy')) this.db.exec("ALTER TABLE projects ADD COLUMN promotion_policy TEXT NOT NULL DEFAULT 'review_required' CHECK(promotion_policy IN ('review_required','auto_push','read_only'))");
+    const promotionRepositoryColumns = this.db.prepare('PRAGMA table_info(promotion_repositories)').all() as unknown as Array<{ name: string }>;
+    if (!promotionRepositoryColumns.some((column) => column.name === 'additions')) this.db.exec('ALTER TABLE promotion_repositories ADD COLUMN additions INTEGER');
+    if (!promotionRepositoryColumns.some((column) => column.name === 'deletions')) this.db.exec('ALTER TABLE promotion_repositories ADD COLUMN deletions INTEGER');
+    if (!promotionRepositoryColumns.some((column) => column.name === 'changed_files')) this.db.exec('ALTER TABLE promotion_repositories ADD COLUMN changed_files INTEGER');
     const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>;
     if (!jobColumns.some((column) => column.name === 'agent')) {
       this.db.exec("ALTER TABLE jobs ADD COLUMN agent TEXT NOT NULL DEFAULT 'mock'");
@@ -357,7 +362,7 @@ export class Store {
     if (!row) return undefined;
     const repos = this.db.prepare('SELECT * FROM promotion_repositories WHERE promotion_id = ? ORDER BY rowid').all(row.id) as Array<Record<string, string | number | null>>;
     return { id: row.id, jobId: row.job_id, commitMessage: row.commit_message, status: row.status as PromotionStatus, createdAt: row.created_at, updatedAt: row.updated_at,
-      repositories: repos.map((r) => ({ repositoryId: String(r.repository_id), status: r.status as PromotionStatus, commitSha: r.commit_sha ? String(r.commit_sha) : undefined, targetBranch: String(r.target_branch), error: r.error ? String(r.error) : undefined, conflict: Boolean(r.conflict), updatedAt: String(r.updated_at) })) };
+      repositories: repos.map((r) => ({ repositoryId: String(r.repository_id), status: r.status as PromotionStatus, commitSha: r.commit_sha ? String(r.commit_sha) : undefined, targetBranch: String(r.target_branch), additions: Number(r.additions ?? 0), deletions: Number(r.deletions ?? 0), changedFiles: Number(r.changed_files ?? 0), error: r.error ? String(r.error) : undefined, conflict: Boolean(r.conflict), updatedAt: String(r.updated_at) })) };
   }
 
   beginPromotion(jobId: string, message: string, runs: JobRepositoryRun[]): { promotion?: Promotion; conflict?: string } {
@@ -385,6 +390,12 @@ export class Store {
     const states = this.db.prepare('SELECT status FROM promotion_repositories WHERE promotion_id=?').all(promotion.id) as Array<{ status: PromotionStatus }>;
     const aggregate: PromotionStatus = states.every((r) => r.status === 'promoted') ? 'promoted' : states.some((r) => r.status === 'promoting') ? 'promoting' : states.some((r) => r.status === 'failed') ? 'failed' : 'pending';
     this.db.prepare('UPDATE promotions SET status=?,updated_at=? WHERE id=?').run(aggregate, now, promotion.id);
+  }
+
+  setPromotionRepositoryStats(jobId: string, repositoryId: string, stats: { additions: number; deletions: number; changedFiles: number }): void {
+    const promotion = this.getPromotion(jobId); if (!promotion) throw new Error('Promotion not found');
+    this.db.prepare('UPDATE promotion_repositories SET additions=?,deletions=?,changed_files=? WHERE promotion_id=? AND repository_id=?')
+      .run(stats.additions, stats.deletions, stats.changedFiles, promotion.id, repositoryId);
   }
 
   createDeployment(jobId: string, repositoryId: string, commitSha: string, run: JobRepositoryRun): { deployment?: Deployment; conflict?: string } {

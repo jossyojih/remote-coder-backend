@@ -77,7 +77,8 @@ export interface JobRepositoryRun {
 }
 export interface PromotionRepositoryResult {
   repositoryId: string; status: PromotionStatus; commitSha?: string;
-  targetBranch: string; error?: string; conflict?: boolean; updatedAt: string;
+  targetBranch: string; additions: number; deletions: number; changedFiles: number;
+  error?: string; conflict?: boolean; updatedAt: string;
 }
 export interface Promotion {
   id: string; jobId: string; commitMessage: string; status: PromotionStatus;
