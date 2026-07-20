@@ -62,6 +62,10 @@ export class JobWorker {
   private scopeRequired(job: Job): boolean {
     const event = this.store.events(job.id).filter((item) => item.type === 'scope_required').at(-1);
     if (!event) return false;
+    // Manual scope is an exact user grant, not a starting point for expansion.
+    // Likewise, "all" already grants the complete project. Only auto scope may
+    // turn an agent's bounded-metadata discovery into an approval request.
+    if (job.scopeMode !== 'auto') return false;
     const data = event.data as { suggestedRepositoryIds?: unknown; reasons?: unknown };
     const suggested = Array.isArray(data?.suggestedRepositoryIds) ? data.suggestedRepositoryIds.filter((id): id is string => typeof id === 'string') : [];
     if (!suggested.length || !this.store.repositoriesBelongTo(job.projectId, suggested)) throw new Error('Agent returned an invalid scope-required result');
@@ -84,32 +88,27 @@ export class JobWorker {
         const project = this.store.getProject(job.projectId); if (!project) throw new Error('Project no longer exists');
         const plan = job.scopeMode === 'all'
           ? { repositoryIds: project.repositories.map((repository) => repository.id), reasons: project.repositories.map((repository) => ({ repositoryId: repository.id, reason: 'All repositories were explicitly granted for this job.' })) }
-          : this.planner.plan(job.prompt.slice(0, 100_000), project.repositories);
+          : job.scopeMode === 'manual'
+            ? { repositoryIds: job.requestedRepositoryIds, reasons: job.requestedRepositoryIds.map((repositoryId) => ({ repositoryId, reason: 'Explicitly selected for manual scope.' })) }
+            : this.planner.plan(job.prompt.slice(0, 100_000), project.repositories);
         if (job.scopeMode === 'manual') {
-          const additional = plan.repositoryIds.filter((id) => !job.requestedRepositoryIds.includes(id));
-          if (additional.length) {
-            const selectedReasons = job.requestedRepositoryIds.map((repositoryId) => plan.reasons.find((reason) => reason.repositoryId === repositoryId) ?? { repositoryId, reason: 'Explicitly selected for manual scope.' });
-            const proposedReasons = additional.map((repositoryId) => plan.reasons.find((reason) => reason.repositoryId === repositoryId) ?? { repositoryId, reason: 'Additional repository access is required for the requested work.' });
-            // Persist the user's manual selection as the resolved scope before
-            // presenting planner suggestions. Suggestions remain separate and
-            // cannot enter the execution scope until a scope decision approves them.
-            this.store.resolveScope(job.id, job.requestedRepositoryIds, selectedReasons, 'pending');
-            this.store.proposeScope(job.id, additional, proposedReasons);
-            this.emit(job.id, 'scope_proposal', 'Additional repository access is required', { status: 'needs_input', requestedRepositoryIds: job.requestedRepositoryIds, resolvedRepositoryIds: job.requestedRepositoryIds, proposedRepositoryIds: additional, reasons: proposedReasons });
-            return;
-          }
-          const reasons = job.requestedRepositoryIds.map((repositoryId) => plan.reasons.find((reason) => reason.repositoryId === repositoryId) ?? { repositoryId, reason: 'Explicitly selected for manual scope.' });
-          this.store.resolveScope(job.id, job.requestedRepositoryIds, reasons);
+          this.store.resolveScope(job.id, plan.repositoryIds, plan.reasons);
         } else this.store.resolveScope(job.id, plan.repositoryIds, plan.reasons);
         current = this.store.getJob(job.id)!;
         this.emit(job.id, 'scope_resolved', `Resolved repository scope to ${current.resolvedRepositoryIds.length} repository${current.resolvedRepositoryIds.length === 1 ? '' : 'ies'}`, { scopeMode: current.scopeMode, requestedRepositoryIds: current.requestedRepositoryIds, resolvedRepositoryIds: current.resolvedRepositoryIds, reasons: current.scopeReasons });
       }
       const project = this.store.getProject(current.projectId); if (!project) throw new Error('Project no longer exists');
-      current = { ...current, repositoryScopeCandidates: project.repositories.map((repository) => ({ repositoryId: repository.id, repositoryName: repository.name, role: this.planner.describe(repository) })) };
+      const candidates = current.scopeMode === 'manual'
+        ? project.repositories.filter((repository) => current.resolvedRepositoryIds.includes(repository.id))
+        : project.repositories;
+      current = { ...current, repositoryScopeCandidates: candidates.map((repository) => ({ repositoryId: repository.id, repositoryName: repository.name, role: this.planner.describe(repository) })) };
       const repositories = this.store.repositories(current.resolvedRepositoryIds);
       if (repositories.length !== current.resolvedRepositoryIds.length || repositories.length === 0) throw new Error('Resolved repository scope is empty or invalid');
       const adapter = this.adapters[current.agent]; if (!adapter) throw new Error(`Agent ${current.agent} is not available`);
-      await adapter.run(current, repositories, (type, message, data) => this.emit(job.id, type, message, data), controller.signal);
+      await adapter.run(current, repositories, (type, message, data) => {
+        if (type === 'scope_required' && current.scopeMode !== 'auto') return;
+        this.emit(job.id, type, message, data);
+      }, controller.signal);
       if (this.scopeRequired(current)) return;
       if (this.store.getJob(job.id)?.status === 'running') {
         this.store.setStatus(job.id, 'done');

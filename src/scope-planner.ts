@@ -15,14 +15,20 @@ export class RepositoryScopePlanner {
     const metadata = new Map(repositories.map((repository) => [repository.id, this.metadata(repository)]));
     const wantsFrontend = /\b(frontend|front-end|ui|react|vite|route|component|page|client|browser|css)\b/.test(text);
     const wantsBackend = /\b(backend|back-end|api|fastify|database|sqlite|migration|worker|server|endpoint)\b/.test(text);
+    const excludesFrontend = /\b(?:do not|don't|dont|must not|never|without)\s+(?:modify(?:ing)?|change|touch|edit|update)?\s*(?:the\s+)?(?:frontend|front-end|ui|client)\b/.test(text);
+    const excludesBackend = /\b(?:do not|don't|dont|must not|never|without)\s+(?:modify(?:ing)?|change|touch|edit|update)?\s*(?:the\s+)?(?:backend|back-end|api|server)\b/.test(text);
     const matches = repositories.filter((repository) => {
       const labels = [repository.name, basename(repository.path)].map((value) => value.toLocaleLowerCase()).filter((value) => value.length >= 2);
       const facts = metadata.get(repository.id)!;
       return labels.some((label) => text.includes(label))
-        || (wantsFrontend && facts.frontend)
-        || (wantsBackend && facts.backend);
+        || (wantsFrontend && !excludesFrontend && facts.frontend)
+        || (wantsBackend && !excludesBackend && facts.backend);
     });
-    const selected = broad ? repositories : matches.length ? matches : repositories.slice(0, 1);
+    const allowed = repositories.filter((repository) => {
+      const facts = metadata.get(repository.id)!;
+      return !(excludesFrontend && facts.frontend) && !(excludesBackend && facts.backend);
+    });
+    const selected = broad ? allowed : matches.length ? matches.filter((repository) => allowed.includes(repository)) : allowed.slice(0, 1);
     return {
       repositoryIds: selected.map((repository) => repository.id),
       reasons: selected.map((repository) => ({ repositoryId: repository.id, reason: broad
