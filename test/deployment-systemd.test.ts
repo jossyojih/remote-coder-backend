@@ -1,10 +1,67 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
+import { pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 import { systemdDeploymentStarter } from '../src/deployment.js';
+
+const exec = promisify(execFile);
+const git = async (cwd: string, ...args: string[]) => (await exec('git', args, { cwd })).stdout.trim();
+
+async function deploymentRepository() {
+  const root = await mkdtemp(join(tmpdir(), 'deployment-git-'));
+  const remote = join(root, 'remote.git');
+  const author = join(root, 'author');
+  const deployed = join(root, 'deployed');
+  await exec('git', ['init', '--bare', remote]);
+  await exec('git', ['clone', remote, author]);
+  await git(author, 'config', 'user.email', 'test@example.com');
+  await git(author, 'config', 'user.name', 'Test');
+  await git(author, 'checkout', '-b', 'main');
+  await writeFile(join(author, 'version'), 'previous\n');
+  await git(author, 'add', 'version'); await git(author, 'commit', '-m', 'previous');
+  const previous = await git(author, 'rev-parse', 'HEAD');
+  await git(author, 'push', '-u', 'origin', 'main');
+  await exec('git', ['clone', '--branch', 'main', remote, deployed]);
+  await writeFile(join(author, 'version'), 'approved\n');
+  await git(author, 'commit', '-am', 'approved');
+  const approved = await git(author, 'rev-parse', 'HEAD');
+  await writeFile(join(author, 'version'), 'newer\n');
+  await git(author, 'commit', '-am', 'newer'); await git(author, 'push');
+  return { deployed, previous, approved };
+}
+
+async function deploymentGit() {
+  const url = pathToFileURL(join(process.cwd(), 'scripts/deploy-backend.mjs')).href;
+  return import(url) as Promise<{
+    checkoutApprovedCommit: (deployment: object) => string;
+    restorePreviousCommit: (deployment: object, previous: string) => void;
+  }>;
+}
+
+test('successful deployment keeps the target branch attached at exactly the approved commit', async () => {
+  const repository = await deploymentRepository();
+  const { checkoutApprovedCommit } = await deploymentGit();
+  const previous = checkoutApprovedCommit({ sourcePath: repository.deployed, remoteName: 'origin', targetBranch: 'main', commitSha: repository.approved });
+  assert.equal(previous, repository.previous);
+  assert.equal(await git(repository.deployed, 'branch', '--show-current'), 'main');
+  assert.equal(await git(repository.deployed, 'rev-parse', 'HEAD'), repository.approved);
+  assert.notEqual(await git(repository.deployed, 'rev-parse', 'origin/main'), repository.approved);
+});
+
+test('deployment rollback restores the previous commit with the target branch attached', async () => {
+  const repository = await deploymentRepository();
+  const { checkoutApprovedCommit, restorePreviousCommit } = await deploymentGit();
+  const deployment = { sourcePath: repository.deployed, remoteName: 'origin', targetBranch: 'main', commitSha: repository.approved };
+  const previous = checkoutApprovedCommit(deployment);
+  restorePreviousCommit(deployment, previous);
+  assert.equal(await git(repository.deployed, 'branch', '--show-current'), 'main');
+  assert.equal(await git(repository.deployed, 'rev-parse', 'HEAD'), repository.previous);
+});
 
 test('systemd handoff invokes systemctl directly with the constrained unit', async () => {
   const root = await mkdtemp(join(tmpdir(), 'deployment-systemctl-'));
