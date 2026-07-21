@@ -36,6 +36,8 @@ export interface AppOptions {
   codexReasoningLevels?: string;
   codexDefaultReasoning?: string;
   claudeModels?: string;
+  claudeReasoningLevels?: string;
+  claudeDefaultReasoning?: string;
   defaultAgent?: string;
   runsRoot?: string;
   jobTimeoutMs?: number;
@@ -91,6 +93,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     codexDefaultReasoning: options.codexDefaultReasoning ?? process.env.CODEX_REASONING_EFFORT,
     claudeModels: options.claudeModels ?? process.env.CLAUDE_MODELS,
     claudeDefaultModel: options.claudeModel ?? process.env.CLAUDE_MODEL,
+    claudeReasoningLevels: options.claudeReasoningLevels ?? process.env.CLAUDE_REASONING_LEVELS,
+    claudeDefaultReasoning: options.claudeDefaultReasoning ?? process.env.CLAUDE_REASONING_EFFORT,
     defaultAgent: options.defaultAgent ?? process.env.DEFAULT_AGENT ?? (process.env.NODE_ENV === 'test' ? 'mock' : 'codex'), allowMock: allowMockAgent,
   });
   const codexCapability = capabilities.agents.find((agent) => agent.id === 'codex')!;

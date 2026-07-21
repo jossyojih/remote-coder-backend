@@ -8,7 +8,7 @@ export type ScopeMode = (typeof SCOPE_MODES)[number];
 export const PROMOTION_POLICIES = ['review_required', 'auto_push', 'read_only'] as const;
 export type PromotionPolicy = (typeof PROMOTION_POLICIES)[number];
 export type Agent = 'mock' | 'codex' | 'claude';
-export type ReasoningLevel = 'low' | 'medium' | 'high';
+export type ReasoningLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface AgentSelection { agent: Agent; model: string; reasoningLevel?: ReasoningLevel }
 export interface ScopeReason { repositoryId: string; reason: string }
 
