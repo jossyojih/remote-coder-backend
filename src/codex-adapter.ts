@@ -61,16 +61,16 @@ export class CodexAgentAdapter implements AgentAdapter {
     const { runDirectory, prepared } = await prepareRepositories(job, repositories, this.options.workspaceRoot, this.options.runsRoot, emit);
 
     const prompt = buildJobPrompt(job, prepared, runDirectory);
-    await this.executeCodex(job.id, prompt, runDirectory, emit, signal);
+    await this.executeCodex(job.id, job.model, job.reasoningLevel!, prompt, runDirectory, emit, signal);
     for (const repository of prepared) {
       try { emit('repository_result', `Collected changes for ${repository.repository.name}`, { ...(await collectChanges(repository)), scopeReason: job.scopeReasons.find((reason) => reason.repositoryId === repository.repository.id)?.reason }); }
       catch (error) { emit('error', `Could not collect changes for ${repository.repository.name}`, { error: error instanceof Error ? error.message : String(error) }); }
     }
   }
 
-  private executeCodex(jobId: string, prompt: string, runDirectory: string, emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
+  private executeCodex(jobId: string, model: string, reasoningLevel: string, prompt: string, runDirectory: string, emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
-      const args = ['exec', '--json', '--ephemeral', '--sandbox', 'workspace-write', '--skip-git-repo-check', '-c', 'approval_policy="never"', '--color', 'never', '-C', runDirectory, '-'];
+      const args = ['exec', '--json', '--ephemeral', '--sandbox', 'workspace-write', '--skip-git-repo-check', '-c', 'approval_policy="never"', '--model', model, '-c', `model_reasoning_effort="${reasoningLevel}"`, '--color', 'never', '-C', runDirectory, '-'];
       const child = spawn(this.options.codexBin, args, { cwd: runDirectory, env: childEnvironment('codex'), detached: process.platform === 'linux', stdio: ['pipe', 'pipe', 'pipe'] });
       let settled = false; let timedOut = false; let protocolCompleted = false; let protocolError: Error | undefined;
       let latestAgentMessage: { message: string; data: unknown } | undefined;

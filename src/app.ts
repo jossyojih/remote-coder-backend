@@ -6,7 +6,8 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, updateProjectPromotionPolicySchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
+import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
+import { buildCapabilities, validateSelection } from './capabilities.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
 import { PromotionConflictError, PromotionService } from './promotion.js';
@@ -30,6 +31,12 @@ export interface AppOptions {
   codexBin?: string;
   claudeBin?: string;
   claudeModel?: string;
+  codexModels?: string;
+  codexDefaultModel?: string;
+  codexReasoningLevels?: string;
+  codexDefaultReasoning?: string;
+  claudeModels?: string;
+  defaultAgent?: string;
   runsRoot?: string;
   jobTimeoutMs?: number;
   jobKillGraceMs?: number;
@@ -77,6 +84,18 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const promotion = new PromotionService(store, workspaceRoot, isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot), deploymentCoordinator);
   const bus = new JobEventBus();
   const allowMockAgent = options.allowMockAgent ?? process.env.NODE_ENV === 'test';
+  const capabilities = buildCapabilities({
+    codexModels: options.codexModels ?? process.env.CODEX_MODELS,
+    codexDefaultModel: options.codexDefaultModel ?? process.env.CODEX_MODEL,
+    codexReasoningLevels: options.codexReasoningLevels ?? process.env.CODEX_REASONING_LEVELS,
+    codexDefaultReasoning: options.codexDefaultReasoning ?? process.env.CODEX_REASONING_EFFORT,
+    claudeModels: options.claudeModels ?? process.env.CLAUDE_MODELS,
+    claudeDefaultModel: options.claudeModel ?? process.env.CLAUDE_MODEL,
+    defaultAgent: options.defaultAgent ?? process.env.DEFAULT_AGENT ?? (process.env.NODE_ENV === 'test' ? 'mock' : 'codex'), allowMock: allowMockAgent,
+  });
+  const codexCapability = capabilities.agents.find((agent) => agent.id === 'codex')!;
+  const claudeCapability = capabilities.agents.find((agent) => agent.id === 'claude')!;
+  store.normalizeLegacySelections({ codexModel: codexCapability.defaults.model, codexReasoning: codexCapability.defaults.reasoningLevel!, claudeModel: claudeCapability.defaults.model });
   const worker = new JobWorker(store, bus, {
     ...(allowMockAgent ? { mock: new MockAgentAdapter(options.mockStepDelayMs) } : {}),
     codex: new CodexAgentAdapter({
@@ -148,6 +167,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     return reply.code(201).send(store.createProject(input.name, repositories));
   });
   app.get('/projects', async () => store.listProjects());
+  app.get('/capabilities', async () => capabilities);
   app.get('/projects/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const project = store.getProject(id);
     return project ?? reply.code(404).send({ error: 'Project not found' });
@@ -160,6 +180,11 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const { id } = idParamsSchema.parse(request.params); const { promotionPolicy } = updateProjectPromotionPolicySchema.parse(request.body);
     const project = store.updateProjectPromotionPolicy(id, promotionPolicy); return project ?? reply.code(404).send({ error: 'Project not found' });
   });
+  app.put('/projects/:id/agent-defaults', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params); const input = updateProjectAgentDefaultsSchema.parse(request.body);
+    if (!store.getProject(id)) return reply.code(404).send({ error: 'Project not found' });
+    return store.updateProjectAgentDefaults(id, validateSelection(capabilities, input))!;
+  });
   app.put('/projects/:id/repositories/:repositoryId/promotion-policy', async (request, reply) => {
     const { id, repositoryId } = projectRepositoryParamsSchema.parse(request.params); const { promotionPolicyOverride } = updateRepositoryPromotionPolicySchema.parse(request.body);
     const project = store.updateRepositoryPromotionPolicy(id, repositoryId, promotionPolicyOverride); return project ?? reply.code(404).send({ error: 'Project or repository not found' });
@@ -170,11 +195,12 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const project = store.getProject(input.projectId); if (!project) return reply.code(404).send({ error: 'Project not found' });
     const requested = input.requestedRepositoryIds ?? input.selectedRepositoryIds ?? [];
     if (requested.length && !store.repositoriesBelongTo(input.projectId, requested)) return reply.code(400).send({ error: 'Every requested repository must belong to the project' });
-    const agent = input.agent ?? (process.env.NODE_ENV === 'test' ? 'mock' : 'codex');
-    if (agent === 'mock' && !allowMockAgent) return reply.code(400).send({ error: 'Mock agents are available only in automated tests' });
+    const projectDefaults = project.defaultAgent ? { agent: project.defaultAgent, model: project.defaultModel, reasoningLevel: project.defaultReasoningLevel } : undefined;
+    const selection = validateSelection(capabilities, input, projectDefaults);
+    if (selection.agent === 'mock' && !allowMockAgent) return reply.code(400).send({ error: 'Mock agents are available only in automated tests' });
     const legacySelection = request.body !== null && typeof request.body === 'object' && !Array.isArray(request.body)
       && !('scopeMode' in request.body) && 'selectedRepositoryIds' in request.body;
-    const job = store.createJob(input.projectId, input.prompt, requested, agent, legacySelection ? 'manual' : input.scopeMode); worker.wake();
+    const job = store.createJob(input.projectId, input.prompt, requested, selection, legacySelection ? 'manual' : input.scopeMode); worker.wake();
     return reply.code(201).send(job);
   });
   app.post('/jobs/:id/scope-decision', async (request, reply) => {
@@ -226,7 +252,9 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   });
   const continueJob = async (request: any, reply: any) => {
     const { id } = idParamsSchema.parse(request.params); const input = followUpSchema.parse(request.body);
-    const result = store.createFollowUp(id, input.message, input.requestId, input.scopeMode, input.requestedRepositoryIds);
+    const parent = store.getJob(id);
+    const selection = parent ? validateSelection(capabilities, { agent: parent.agent, model: input.model ?? parent.model, reasoningLevel: input.reasoningLevel ?? parent.reasoningLevel }) : undefined;
+    const result = store.createFollowUp(id, input.message, input.requestId, input.scopeMode, input.requestedRepositoryIds, selection);
     if (result.conflict === 'not_found') return reply.code(404).send({ error: 'Job not found' });
     if (result.conflict === 'parent_active') return reply.code(409).send({ error: 'Only terminal jobs can be continued' });
     if (result.conflict === 'not_latest') return reply.code(409).send({ error: 'Only the latest job in a conversation can be continued' });

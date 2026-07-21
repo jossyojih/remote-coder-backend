@@ -7,6 +7,9 @@ export const SCOPE_MODES = ['auto', 'manual', 'all'] as const;
 export type ScopeMode = (typeof SCOPE_MODES)[number];
 export const PROMOTION_POLICIES = ['review_required', 'auto_push', 'read_only'] as const;
 export type PromotionPolicy = (typeof PROMOTION_POLICIES)[number];
+export type Agent = 'mock' | 'codex' | 'claude';
+export type ReasoningLevel = 'low' | 'medium' | 'high';
+export interface AgentSelection { agent: Agent; model: string; reasoningLevel?: ReasoningLevel }
 export interface ScopeReason { repositoryId: string; reason: string }
 
 export interface Project {
@@ -14,6 +17,9 @@ export interface Project {
   name: string;
   createdAt: string;
   promotionPolicy: PromotionPolicy;
+  defaultAgent?: Agent;
+  defaultModel?: string;
+  defaultReasoningLevel?: ReasoningLevel;
   repositories: Repository[];
 }
 
@@ -33,7 +39,9 @@ export interface Job {
   id: string;
   projectId: string;
   prompt: string;
-  agent: 'mock' | 'codex' | 'claude';
+  agent: Agent;
+  model: string;
+  reasoningLevel?: ReasoningLevel;
   status: JobStatus;
   scopeMode: ScopeMode;
   requestedRepositoryIds: string[];

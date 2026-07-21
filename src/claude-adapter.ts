@@ -5,7 +5,7 @@ import type { AgentAdapter, AgentEventEmitter, Job, Repository } from './types.j
 
 export interface ClaudeAdapterOptions {
   claudeBin: string;
-  model: string;
+  model?: string;
   runsRoot: string;
   workspaceRoot: string;
   timeoutMs: number;
@@ -100,16 +100,16 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
   async run(job: Job, repositories: Repository[], emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
     const { runDirectory, prepared } = await prepareRepositories(job, repositories, this.options.workspaceRoot, this.options.runsRoot, emit);
-    await this.executeClaude(job.id, buildJobPrompt(job, prepared, runDirectory), runDirectory, emit, signal);
+    await this.executeClaude(job.id, job.model, buildJobPrompt(job, prepared, runDirectory), runDirectory, emit, signal);
     for (const repository of prepared) {
       try { emit('repository_result', `Collected changes for ${repository.repository.name}`, { ...(await collectChanges(repository)), scopeReason: job.scopeReasons.find((reason) => reason.repositoryId === repository.repository.id)?.reason }); }
       catch (error) { emit('error', `Could not collect changes for ${repository.repository.name}`, { error: error instanceof Error ? error.message : String(error) }); }
     }
   }
 
-  private executeClaude(jobId: string, prompt: string, runDirectory: string, emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
+  private executeClaude(jobId: string, model: string, prompt: string, runDirectory: string, emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
-      const args = ['--print', '--output-format', 'stream-json', '--verbose', '--model', this.options.model, '--permission-mode', 'dontAsk', '--allowedTools', 'Bash,Edit,Write,Read,Glob,Grep', '--no-session-persistence', '--disable-slash-commands', '--no-chrome', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'];
+      const args = ['--print', '--output-format', 'stream-json', '--verbose', '--model', model, '--permission-mode', 'dontAsk', '--allowedTools', 'Bash,Edit,Write,Read,Glob,Grep', '--no-session-persistence', '--disable-slash-commands', '--no-chrome', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'];
       const child = spawn(this.options.claudeBin, args, { cwd: runDirectory, env: childEnvironment('claude'), detached: process.platform === 'linux', stdio: ['pipe', 'pipe', 'pipe'] });
       let settled = false; let timedOut = false; let protocolCompleted = false; let protocolError: Error | undefined; let finalResponse: TranslatedEvent | undefined;
       this.options.log.info({ jobId, adapter: 'claude', childPid: child.pid }, 'agent child started');

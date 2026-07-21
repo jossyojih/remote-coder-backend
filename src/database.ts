@@ -1,11 +1,11 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
+import type { AgentSelection, Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
 
-type ProjectRow = { id: string; name: string; created_at: string; promotion_policy: PromotionPolicy };
+type ProjectRow = { id: string; name: string; created_at: string; promotion_policy: PromotionPolicy; default_agent: AgentSelection['agent'] | null; default_model: string | null; default_reasoning_level: AgentSelection['reasoningLevel'] | null };
 type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; promotion_policy_override?: PromotionPolicy | null; created_at: string };
-type JobRow = { id: string; project_id: string; prompt: string; agent: 'mock' | 'codex' | 'claude'; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string };
+type JobRow = { id: string; project_id: string; prompt: string; agent: AgentSelection['agent']; model: string | null; reasoning_level: AgentSelection['reasoningLevel'] | null; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
 function objectData(value: unknown): Record<string, unknown> | undefined {
@@ -77,6 +77,9 @@ export class Store {
     if (!repositoryColumns.some((column) => column.name === 'promotion_policy_override')) this.db.exec("ALTER TABLE repositories ADD COLUMN promotion_policy_override TEXT CHECK(promotion_policy_override IN ('review_required','auto_push','read_only'))");
     const projectColumns = this.db.prepare('PRAGMA table_info(projects)').all() as unknown as Array<{ name: string }>;
     if (!projectColumns.some((column) => column.name === 'promotion_policy')) this.db.exec("ALTER TABLE projects ADD COLUMN promotion_policy TEXT NOT NULL DEFAULT 'review_required' CHECK(promotion_policy IN ('review_required','auto_push','read_only'))");
+    if (!projectColumns.some((column) => column.name === 'default_agent')) this.db.exec('ALTER TABLE projects ADD COLUMN default_agent TEXT');
+    if (!projectColumns.some((column) => column.name === 'default_model')) this.db.exec('ALTER TABLE projects ADD COLUMN default_model TEXT');
+    if (!projectColumns.some((column) => column.name === 'default_reasoning_level')) this.db.exec('ALTER TABLE projects ADD COLUMN default_reasoning_level TEXT');
     const promotionRepositoryColumns = this.db.prepare('PRAGMA table_info(promotion_repositories)').all() as unknown as Array<{ name: string }>;
     if (!promotionRepositoryColumns.some((column) => column.name === 'additions')) this.db.exec('ALTER TABLE promotion_repositories ADD COLUMN additions INTEGER');
     if (!promotionRepositoryColumns.some((column) => column.name === 'deletions')) this.db.exec('ALTER TABLE promotion_repositories ADD COLUMN deletions INTEGER');
@@ -113,6 +116,8 @@ export class Store {
     if (!migratedJobColumns.some((column) => column.name === 'scope_state')) this.db.exec("ALTER TABLE jobs ADD COLUMN scope_state TEXT NOT NULL DEFAULT 'resolved'");
     if (!migratedJobColumns.some((column) => column.name === 'scope_reasons')) this.db.exec("ALTER TABLE jobs ADD COLUMN scope_reasons TEXT NOT NULL DEFAULT '[]'");
     if (!migratedJobColumns.some((column) => column.name === 'proposed_repository_ids')) this.db.exec("ALTER TABLE jobs ADD COLUMN proposed_repository_ids TEXT NOT NULL DEFAULT '[]'");
+    if (!migratedJobColumns.some((column) => column.name === 'model')) this.db.exec("ALTER TABLE jobs ADD COLUMN model TEXT NOT NULL DEFAULT ''");
+    if (!migratedJobColumns.some((column) => column.name === 'reasoning_level')) this.db.exec('ALTER TABLE jobs ADD COLUMN reasoning_level TEXT');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS job_requested_repositories (job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, repository_id TEXT NOT NULL REFERENCES repositories(id), PRIMARY KEY(job_id,repository_id));
       INSERT OR IGNORE INTO job_requested_repositories SELECT job_id, repository_id FROM job_repositories;
@@ -127,6 +132,13 @@ export class Store {
   }
 
   close() { this.db.close(); }
+
+  normalizeLegacySelections(defaults: { codexModel: string; codexReasoning: string; claudeModel: string }): void {
+    this.db.prepare("UPDATE jobs SET model=? WHERE agent='codex' AND (model IS NULL OR model='')").run(defaults.codexModel);
+    this.db.prepare("UPDATE jobs SET reasoning_level=? WHERE agent='codex' AND reasoning_level IS NULL").run(defaults.codexReasoning);
+    this.db.prepare("UPDATE jobs SET model=? WHERE agent='claude' AND (model IS NULL OR model='')").run(defaults.claudeModel);
+    this.db.prepare("UPDATE jobs SET model='mock' WHERE agent='mock' AND (model IS NULL OR model='')").run();
+  }
 
   createProject(name: string, repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string }>): Project {
     const id = crypto.randomUUID();
@@ -153,7 +165,7 @@ export class Store {
 
   private mapProject(row: ProjectRow): Project {
     const repos = this.db.prepare('SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, name').all(row.id) as unknown as RepoRow[];
-    return { id: row.id, name: row.name, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required')) };
+    return { id: row.id, name: row.name, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', defaultAgent: row.default_agent ?? undefined, defaultModel: row.default_model ?? undefined, defaultReasoningLevel: row.default_reasoning_level ?? undefined, repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required')) };
   }
 
   private mapRepo = (row: RepoRow, projectPolicy?: PromotionPolicy): Repository => {
@@ -163,6 +175,11 @@ export class Store {
 
   updateProjectPromotionPolicy(id: string, policy: PromotionPolicy): Project | undefined {
     const result = this.db.prepare('UPDATE projects SET promotion_policy=? WHERE id=?').run(policy, id);
+    return Number(result.changes) ? this.getProject(id) : undefined;
+  }
+
+  updateProjectAgentDefaults(id: string, selection: AgentSelection): Project | undefined {
+    const result = this.db.prepare('UPDATE projects SET default_agent=?, default_model=?, default_reasoning_level=? WHERE id=?').run(selection.agent, selection.model, selection.reasoningLevel ?? null, id);
     return Number(result.changes) ? this.getProject(id) : undefined;
   }
 
@@ -186,11 +203,14 @@ export class Store {
     return ids.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
   }
 
-  createJob(projectId: string, prompt: string, repositoryIds: string[], agent: 'mock' | 'codex' | 'claude', scopeMode: ScopeMode): Job {
+  createJob(projectId: string, prompt: string, repositoryIds: string[], requestedSelection: AgentSelection | AgentSelection['agent'], scopeMode: ScopeMode): Job {
+    const selection: AgentSelection = typeof requestedSelection === 'string'
+      ? { agent: requestedSelection, model: requestedSelection === 'claude' ? 'sonnet' : requestedSelection === 'mock' ? 'mock' : 'gpt-5-codex', ...(requestedSelection === 'codex' ? { reasoningLevel: 'medium' as const } : {}) }
+      : requestedSelection;
     const id = crypto.randomUUID(); const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,thread_id,scope_mode,scope_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, projectId, prompt, 'queued', now, now, agent, id, scopeMode, 'pending');
+      this.db.prepare('INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,model,reasoning_level,thread_id,scope_mode,scope_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, projectId, prompt, 'queued', now, now, selection.agent, selection.model, selection.reasoningLevel ?? null, id, scopeMode, 'pending');
       const insert = this.db.prepare('INSERT INTO job_requested_repositories VALUES (?, ?)');
       for (const repositoryId of repositoryIds) insert.run(id, repositoryId);
       this.addEvent(id, 'status', 'Job queued', { status: 'queued' });
@@ -232,7 +252,7 @@ export class Store {
     const reasons = JSON.parse(row.scope_reasons ?? '[]') as ScopeReason[];
     const proposed = JSON.parse(row.proposed_repository_ids ?? '[]') as string[];
     const job: Job = {
-      id: row.id, projectId: row.project_id, prompt: row.prompt, agent: row.agent ?? 'mock', status: row.status,
+      id: row.id, projectId: row.project_id, prompt: row.prompt, agent: row.agent ?? 'mock', model: row.model || (row.agent === 'claude' ? 'sonnet' : row.agent === 'mock' ? 'mock' : 'gpt-5-codex'), reasoningLevel: row.reasoning_level ?? undefined, status: row.status,
       scopeMode: row.scope_mode ?? 'manual', requestedRepositoryIds: requested.map((x) => x.repository_id), resolvedRepositoryIds: selected.map((x) => x.repository_id), scopeReasons: reasons,
       proposedRepositoryIds: proposed.length ? proposed : undefined,
       selectedRepositoryIds: selected.length ? selected.map((x) => x.repository_id) : requested.map((x) => x.repository_id), parentJobId: row.parent_job_id ?? undefined,
@@ -276,7 +296,7 @@ export class Store {
     return rows.map((row) => this.mapJob(row));
   }
 
-  createFollowUp(parentId: string, message: string, requestId: string, scopeMode?: ScopeMode, requestedRepositoryIds?: string[]): { job?: Job; conflict?: string } {
+  createFollowUp(parentId: string, message: string, requestId: string, scopeMode?: ScopeMode, requestedRepositoryIds?: string[], selection?: AgentSelection): { job?: Job; conflict?: string } {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const parentRow = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(parentId) as unknown as JobRow | undefined;
@@ -296,9 +316,10 @@ export class Store {
       const context = this.buildConversationContext(threadId);
       const effectiveMode = scopeMode ?? parentRow.scope_mode;
       const replan = scopeMode === 'auto' || scopeMode === 'all';
-      this.db.prepare(`INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,parent_job_id,thread_id,conversation_context,follow_up_request_id,scope_mode,scope_state,scope_reasons)
-        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(id, parentRow.project_id, message, now, now, parentRow.agent, parentId, threadId, context, requestId, effectiveMode, replan ? 'pending' : 'resolved', replan ? '[]' : parentRow.scope_reasons);
+      const effectiveSelection = selection ?? { agent: parentRow.agent, model: parentRow.model || (parentRow.agent === 'claude' ? 'sonnet' : 'gpt-5-codex'), reasoningLevel: parentRow.reasoning_level ?? undefined };
+      this.db.prepare(`INSERT INTO jobs(id,project_id,prompt,status,created_at,updated_at,agent,model,reasoning_level,parent_job_id,thread_id,conversation_context,follow_up_request_id,scope_mode,scope_state,scope_reasons)
+        VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, parentRow.project_id, message, now, now, effectiveSelection.agent, effectiveSelection.model, effectiveSelection.reasoningLevel ?? null, parentId, threadId, context, requestId, effectiveMode, replan ? 'pending' : 'resolved', replan ? '[]' : parentRow.scope_reasons);
       const insert = this.db.prepare('INSERT INTO job_repositories VALUES (?, ?)');
       if (!replan) for (const repositoryId of repositoryIds) insert.run(id, repositoryId);
       const insertRequested = this.db.prepare('INSERT INTO job_requested_repositories VALUES (?, ?)');

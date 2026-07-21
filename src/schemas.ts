@@ -5,6 +5,8 @@ export const projectRepositoryParamsSchema = z.object({ id: z.string().uuid(), r
 export const promotionPolicySchema = z.enum(['review_required', 'auto_push', 'read_only']);
 export const updateProjectPromotionPolicySchema = z.object({ promotionPolicy: promotionPolicySchema });
 export const updateRepositoryPromotionPolicySchema = z.object({ promotionPolicyOverride: promotionPolicySchema.nullable() });
+export const agentSelectionSchema = z.object({ agent: z.enum(['mock', 'codex', 'claude']).optional(), model: z.string().max(128).optional(), reasoningLevel: z.enum(['low', 'medium', 'high']).optional() });
+export const updateProjectAgentDefaultsSchema = agentSelectionSchema.refine((value) => value.agent !== undefined, { message: 'Agent is required', path: ['agent'] });
 
 export const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(200),
@@ -23,6 +25,8 @@ export const createJobSchema = z.object({
   requestedRepositoryIds: z.array(z.string().uuid()).optional(),
   selectedRepositoryIds: z.array(z.string().uuid()).optional(),
   agent: z.enum(['mock', 'codex', 'claude']).optional(),
+  model: z.string().max(128).optional(),
+  reasoningLevel: z.enum(['low', 'medium', 'high']).optional(),
 }).superRefine((value, context) => {
   const ids = value.requestedRepositoryIds ?? value.selectedRepositoryIds ?? [];
   if (new Set(ids).size !== ids.length) {
@@ -51,6 +55,8 @@ export const followUpSchema = z.object({
   requestId: z.string().uuid(),
   scopeMode: z.enum(['auto', 'manual', 'all']).optional(),
   requestedRepositoryIds: z.array(z.string().uuid()).optional(),
+  model: z.string().max(128).optional(),
+  reasoningLevel: z.enum(['low', 'medium', 'high']).optional(),
 }).superRefine((value, context) => {
   const ids = value.requestedRepositoryIds ?? [];
   if (new Set(ids).size !== ids.length) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository IDs must be unique' });
