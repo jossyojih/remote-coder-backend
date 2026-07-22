@@ -1,5 +1,4 @@
 import { realpathSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { Writable } from 'node:stream';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -14,6 +13,7 @@ import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword }
 import { PromotionConflictError, PromotionService } from './promotion.js';
 import { DeploymentCoordinator, systemdDeploymentStarter, type DeploymentStarter } from './deployment.js';
 import { DEPLOYMENT_STATUSES } from './types.js';
+import { MaintenanceService } from './maintenance.js';
 
 export interface AppOptions {
   databasePath?: string;
@@ -43,17 +43,22 @@ export interface AppOptions {
   runsRoot?: string;
   jobTimeoutMs?: number;
   jobKillGraceMs?: number;
-  archivePurgeIntervalMs?: number;
   allowMockAgent?: boolean;
   backendDeployRepositoryPath?: string;
   deploymentApiToken?: string;
   deploymentStarter?: DeploymentStarter;
+  maintenanceIntervalMs?: number;
+  terminalGracePeriodMs?: number;
+  failedRetentionMs?: number;
+  diskWarningThreshold?: number;
+  cleanupBatchLimit?: number;
 }
 
 export interface CommandCenterApp {
   app: FastifyInstance;
   store: Store;
   worker: JobWorker;
+  maintenance: MaintenanceService;
 }
 
 function validatedRepositoryPath(input: string, workspaceRoot: string): string {
@@ -327,26 +332,70 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     request.raw.on('close', cleanup);
   });
 
-  const purgeExpired = async () => {
-    for (const expired of store.expiredThreadRuns(now())) {
-      let safeToPurge = true;
-      for (const run of expired.runs) {
-        const target = resolve(run.worktreePath);
-        const rel = relative(resolve(absoluteRunsRoot), target);
-        if (!rel || rel.startsWith('..') || isAbsolute(rel) || resolve(run.sourcePath) === target) {
-          app.log.error({ threadId: expired.threadId }, 'refusing to purge worktree outside runs root');
-          safeToPurge = false;
-          continue;
-        }
-        await rm(target, { recursive: true, force: true });
-      }
-      if (safeToPurge) store.purgeExpiredThread(expired.threadId, now());
+  app.get('/maintenance/status', async () => {
+    const status = maintenance.getStatus();
+    return {
+      lastRunAt: status.lastRunAt,
+      lastRunCompletedAt: status.lastRunCompletedAt,
+      isRunning: status.isRunning,
+      eligibleWorktrees: status.eligibleWorktrees,
+      protectedWorktrees: status.protectedWorktrees,
+      lastCleanedCount: status.lastCleanedCount,
+      lastFailedCount: status.lastFailedCount,
+      totalReclaimedBytes: status.totalReclaimedBytes,
+      retainedWorktreeCount: status.retainedWorktreeCount,
+      retainedWorktreeBytes: status.retainedWorktreeBytes,
+    };
+  });
+
+  app.get('/maintenance/preview', async () => {
+    const preview = await maintenance.previewCleanup();
+    return {
+      eligible: preview.eligible.map((item) => ({
+        jobId: item.jobId,
+        repositoryId: item.repositoryId,
+        reason: item.reason,
+        estimatedBytes: item.estimatedBytes,
+      })),
+      protectedWorktrees: preview.protectedWorktrees.map((item) => ({
+        jobId: item.jobId,
+        repositoryId: item.repositoryId,
+        reason: item.reason,
+      })),
+    };
+  });
+
+  app.post('/maintenance/cleanup', async (request, reply) => {
+    const result = await maintenance.triggerMaintenance();
+    if (!result.started) {
+      return reply.code(409).send({ error: 'Maintenance is already running' });
     }
-  };
-  await purgeExpired();
-  const purgeTimer = setInterval(() => void purgeExpired().catch((error) => app.log.error({ err: error }, 'archive purge failed')), options.archivePurgeIntervalMs ?? 60 * 60 * 1000);
-  purgeTimer.unref();
-  app.addHook('onClose', async () => { clearInterval(purgeTimer); await worker.stop(); store.close(); });
+    return { started: true };
+  });
+
+  app.get('/maintenance/history', async () => {
+    return {
+      cleaned: maintenance.getCleanupHistory(20),
+      failed: maintenance.getFailureHistory(20),
+    };
+  });
+
+  const maintenance = new MaintenanceService(
+    store,
+    {
+      runsRoot: absoluteRunsRoot,
+      intervalMs: options.maintenanceIntervalMs ?? Number(process.env.MAINTENANCE_INTERVAL_MS ?? 12 * 60 * 60 * 1000),
+      terminalGracePeriodMs: options.terminalGracePeriodMs ?? Number(process.env.TERMINAL_GRACE_PERIOD_MS ?? 24 * 60 * 60 * 1000),
+      failedRetentionMs: options.failedRetentionMs ?? Number(process.env.FAILED_RETENTION_MS ?? 7 * 24 * 60 * 60 * 1000),
+      diskWarningThreshold: options.diskWarningThreshold ?? Number(process.env.DISK_WARNING_THRESHOLD ?? 0.85),
+      batchLimit: options.cleanupBatchLimit ?? Number(process.env.CLEANUP_BATCH_LIMIT ?? 50),
+    },
+    app.log,
+    now,
+  );
+
+  await maintenance.start();
+  app.addHook('onClose', async () => { maintenance.stop(); await worker.stop(); store.close(); });
   worker.start();
-  return { app, store, worker };
+  return { app, store, worker, maintenance };
 }

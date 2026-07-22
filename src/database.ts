@@ -528,4 +528,19 @@ export class Store {
     this.db.prepare('UPDATE deployments SET status=?,stage=?,error_code=?,updated_at=? WHERE id=?').run(status, stage, errorCode ?? null, new Date().toISOString(), id);
     return this.getDeployment(id);
   }
+
+  allRepositoryRuns(): JobRepositoryRun[] {
+    type RunRow = { job_id: string; repository_id: string; worktree_path: string; source_path: string; branch: string; remote_name: string; remote_url: string; target_branch: string; base_commit_sha: string; git_common_dir: string };
+    const rows = this.db.prepare('SELECT * FROM job_repository_runs ORDER BY rowid').all() as unknown as RunRow[];
+    return rows.map((r) => ({ jobId: r.job_id, repositoryId: r.repository_id, worktreePath: r.worktree_path, sourcePath: r.source_path, branch: r.branch, remoteName: r.remote_name, remoteUrl: r.remote_url, targetBranch: r.target_branch, baseCommitSha: r.base_commit_sha, gitCommonDir: r.git_common_dir }));
+  }
+
+  removeRepositoryRun(jobId: string, repositoryId: string): void {
+    this.db.prepare('DELETE FROM job_repository_runs WHERE job_id=? AND repository_id=?').run(jobId, repositoryId);
+  }
+
+  activeDeploymentsForJob(jobId: string): Deployment[] {
+    const rows = this.db.prepare("SELECT * FROM deployments WHERE job_id=? AND status IN ('queued','deploying') ORDER BY created_at,rowid").all(jobId) as Array<Record<string, string | null>>;
+    return rows.map((row) => this.mapDeployment(row));
+  }
 }
