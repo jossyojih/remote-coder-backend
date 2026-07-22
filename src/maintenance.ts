@@ -12,6 +12,7 @@ export interface MaintenanceConfig {
   failedRetentionMs: number;
   diskWarningThreshold: number;
   batchLimit: number;
+  cleanupEnabled: boolean;
 }
 
 export interface MaintenanceStatus {
@@ -187,6 +188,11 @@ export class MaintenanceService {
     const protectedWorktrees: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string }> = [];
 
     for (const run of runs) {
+      const job = this.store.getJob(run.jobId, true);
+      if (job?.archivedAt) {
+        continue;
+      }
+
       const result = await this.checkEligibility(run.jobId, run);
       if (result.eligible) {
         eligible.push({
@@ -272,49 +278,56 @@ export class MaintenanceService {
     let reclaimed = 0;
 
     for (const run of runs) {
-      if (cleaned >= this.config.batchLimit) {
+      if (this.config.cleanupEnabled && cleaned >= this.config.batchLimit) {
         this.log.info({ batchLimit: this.config.batchLimit }, 'batch limit reached, deferring remaining cleanup');
         break;
+      }
+
+      const job = this.store.getJob(run.jobId, true);
+      if (job?.archivedAt) {
+        continue;
       }
 
       const result = await this.checkEligibility(run.jobId, run);
 
       if (result.eligible) {
         eligible++;
-        try {
-          await removeWorktree(run.worktreePath, run.sourcePath, this.config.runsRoot, this.log);
-          this.store.removeRepositoryRun(run.jobId, run.repositoryId);
+        if (this.config.cleanupEnabled) {
+          try {
+            await removeWorktree(run.worktreePath, run.sourcePath, this.config.runsRoot, this.log);
+            this.store.removeRepositoryRun(run.jobId, run.repositoryId);
 
-          const cleanupResult: CleanupResult = {
-            jobId: run.jobId,
-            repositoryId: run.repositoryId,
-            worktreePath: run.worktreePath,
-            reason: result.reason,
-            reclaimedBytes: result.reclaimedBytes,
-            cleanedAt: new Date(this.now()).toISOString(),
-          };
+            const cleanupResult: CleanupResult = {
+              jobId: run.jobId,
+              repositoryId: run.repositoryId,
+              worktreePath: run.worktreePath,
+              reason: result.reason,
+              reclaimedBytes: result.reclaimedBytes,
+              cleanedAt: new Date(this.now()).toISOString(),
+            };
 
-          this.cleanupHistory.push(cleanupResult);
-          if (this.cleanupHistory.length > 100) this.cleanupHistory.shift();
+            this.cleanupHistory.push(cleanupResult);
+            if (this.cleanupHistory.length > 100) this.cleanupHistory.shift();
 
-          cleaned++;
-          reclaimed += result.reclaimedBytes;
-          this.log.info({ jobId: run.jobId, repositoryId: run.repositoryId, reason: result.reason }, 'cleaned worktree');
-        } catch (error) {
-          failed++;
-          const failure: CleanupFailure = {
-            jobId: run.jobId,
-            repositoryId: run.repositoryId,
-            worktreePath: run.worktreePath,
-            reason: result.reason,
-            errorCode: error instanceof Error ? (error.message.includes('ENOENT') ? 'not_found' : error.message.includes('outside') ? 'path_escape' : 'cleanup_failed') : 'unknown_error',
-            failedAt: new Date(this.now()).toISOString(),
-          };
+            cleaned++;
+            reclaimed += result.reclaimedBytes;
+            this.log.info({ jobId: run.jobId, repositoryId: run.repositoryId, reason: result.reason }, 'cleaned worktree');
+          } catch (error) {
+            failed++;
+            const failure: CleanupFailure = {
+              jobId: run.jobId,
+              repositoryId: run.repositoryId,
+              worktreePath: run.worktreePath,
+              reason: result.reason,
+              errorCode: error instanceof Error ? (error.message.includes('ENOENT') ? 'not_found' : error.message.includes('outside') ? 'path_escape' : 'cleanup_failed') : 'unknown_error',
+              failedAt: new Date(this.now()).toISOString(),
+            };
 
-          this.failureHistory.push(failure);
-          if (this.failureHistory.length > 100) this.failureHistory.shift();
+            this.failureHistory.push(failure);
+            if (this.failureHistory.length > 100) this.failureHistory.shift();
 
-          this.log.error({ jobId: run.jobId, repositoryId: run.repositoryId, err: error }, 'failed to clean worktree');
+            this.log.error({ jobId: run.jobId, repositoryId: run.repositoryId, err: error }, 'failed to clean worktree');
+          }
         }
       } else {
         protectedCount++;

@@ -389,6 +389,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       failedRetentionMs: options.failedRetentionMs ?? Number(process.env.FAILED_RETENTION_MS ?? 7 * 24 * 60 * 60 * 1000),
       diskWarningThreshold: options.diskWarningThreshold ?? Number(process.env.DISK_WARNING_THRESHOLD ?? 0.85),
       batchLimit: options.cleanupBatchLimit ?? Number(process.env.CLEANUP_BATCH_LIMIT ?? 50),
+      cleanupEnabled: process.env.MAINTENANCE_CLEANUP_ENABLED === 'true',
     },
     app.log,
     now,
