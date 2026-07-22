@@ -67,6 +67,9 @@ export class JobWorker {
     // Likewise, "all" already grants the complete project. Only auto scope may
     // turn an agent's bounded-metadata discovery into an approval request.
     if (job.scopeMode !== 'auto') return false;
+    // If we've already proposed scope and are awaiting user decision, don't propose again.
+    const state = this.store.scopeState(job.id);
+    if (state === 'awaiting_decision' || state === 'awaiting_correction') return true;
     const data = event.data as { suggestedRepositoryIds?: unknown; reasons?: unknown };
     const suggested = Array.isArray(data?.suggestedRepositoryIds) ? data.suggestedRepositoryIds.filter((id): id is string => typeof id === 'string') : [];
     if (!suggested.length || !this.store.repositoriesBelongTo(job.projectId, suggested)) throw new Error('Agent returned an invalid scope-required result');
