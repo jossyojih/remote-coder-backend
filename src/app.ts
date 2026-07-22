@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { Writable } from 'node:stream';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -42,6 +43,7 @@ export interface AppOptions {
   runsRoot?: string;
   jobTimeoutMs?: number;
   jobKillGraceMs?: number;
+  archivePurgeIntervalMs?: number;
   allowMockAgent?: boolean;
   backendDeployRepositoryPath?: string;
   deploymentApiToken?: string;
@@ -82,8 +84,9 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const workspaceRoot = options.workspaceRoot ?? process.env.WORKSPACE_ROOT ?? process.cwd();
   const store = new Store(options.databasePath ?? process.env.DATABASE_PATH ?? './data/command-center.sqlite');
   const runsRoot = options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs';
+  const absoluteRunsRoot = isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot);
   const deploymentCoordinator = new DeploymentCoordinator(store, options.backendDeployRepositoryPath ?? process.env.BACKEND_DEPLOY_REPOSITORY_PATH, options.deploymentStarter ?? systemdDeploymentStarter());
-  const promotion = new PromotionService(store, workspaceRoot, isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot), deploymentCoordinator);
+  const promotion = new PromotionService(store, workspaceRoot, absoluteRunsRoot, deploymentCoordinator);
   const bus = new JobEventBus();
   const allowMockAgent = options.allowMockAgent ?? process.env.NODE_ENV === 'test';
   const capabilities = buildCapabilities({
@@ -220,6 +223,26 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const query = request.query as { projectId?: string };
     return store.listJobs(query.projectId);
   });
+  app.get('/threads/archived', async () => store.archivedThreads(new Date(now()).toISOString()));
+  app.post('/threads/:id/archive', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const body = (request.body ?? {}) as { confirmActive?: unknown };
+    if (body.confirmActive !== undefined && typeof body.confirmActive !== 'boolean') return reply.code(400).send({ error: 'confirmActive must be a boolean' });
+    const active = store.threadActiveJobIds(id);
+    if (!active) return reply.code(404).send({ error: 'Thread not found' });
+    if (active.length && body.confirmActive !== true) return reply.code(409).send({ error: 'Archiving this thread requires confirmation because execution is active', code: 'active_confirmation_required' });
+    for (const jobId of active) worker.cancel(jobId);
+    const result = store.archiveThread(id, now());
+    if (result.conflict === 'active') return reply.code(409).send({ error: 'Active execution could not be cancelled' });
+    return result.thread;
+  });
+  app.post('/threads/:id/restore', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const result = store.restoreThread(id, now());
+    if (result.conflict === 'not_found') return reply.code(404).send({ error: 'Thread not found' });
+    if (result.conflict === 'expired') return reply.code(410).send({ error: 'The restore grace period has expired' });
+    return { threadId: result.threadId };
+  });
   app.get('/jobs/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const job = store.getJob(id);
     return job ?? reply.code(404).send({ error: 'Job not found' });
@@ -264,6 +287,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     if (result.conflict === 'not_latest') return reply.code(409).send({ error: 'Only the latest job in a conversation can be continued' });
     if (result.conflict === 'thread_active') return reply.code(409).send({ error: 'This conversation already has an active job' });
     if (result.conflict === 'scope_invalid') return reply.code(409).send({ error: 'The original repository scope is no longer valid' });
+    if (result.conflict === 'archived') return reply.code(409).send({ error: 'Archived threads cannot be continued' });
     worker.wake(); return reply.code(201).send(result.job);
   };
   app.post('/jobs/:id/follow-ups', continueJob);
@@ -303,7 +327,26 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     request.raw.on('close', cleanup);
   });
 
-  app.addHook('onClose', async () => { await worker.stop(); store.close(); });
+  const purgeExpired = async () => {
+    for (const expired of store.expiredThreadRuns(now())) {
+      let safeToPurge = true;
+      for (const run of expired.runs) {
+        const target = resolve(run.worktreePath);
+        const rel = relative(resolve(absoluteRunsRoot), target);
+        if (!rel || rel.startsWith('..') || isAbsolute(rel) || resolve(run.sourcePath) === target) {
+          app.log.error({ threadId: expired.threadId }, 'refusing to purge worktree outside runs root');
+          safeToPurge = false;
+          continue;
+        }
+        await rm(target, { recursive: true, force: true });
+      }
+      if (safeToPurge) store.purgeExpiredThread(expired.threadId, now());
+    }
+  };
+  await purgeExpired();
+  const purgeTimer = setInterval(() => void purgeExpired().catch((error) => app.log.error({ err: error }, 'archive purge failed')), options.archivePurgeIntervalMs ?? 60 * 60 * 1000);
+  purgeTimer.unref();
+  app.addHook('onClose', async () => { clearInterval(purgeTimer); await worker.stop(); store.close(); });
   worker.start();
   return { app, store, worker };
 }

@@ -1,11 +1,11 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { AgentSelection, Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
+import type { AgentSelection, ArchivedThread, Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
 
 type ProjectRow = { id: string; name: string; created_at: string; promotion_policy: PromotionPolicy; default_agent: AgentSelection['agent'] | null; default_model: string | null; default_reasoning_level: AgentSelection['reasoningLevel'] | null };
 type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; promotion_policy_override?: PromotionPolicy | null; created_at: string };
-type JobRow = { id: string; project_id: string; prompt: string; agent: AgentSelection['agent']; model: string | null; reasoning_level: AgentSelection['reasoningLevel'] | null; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string };
+type JobRow = { id: string; project_id: string; prompt: string; agent: AgentSelection['agent']; model: string | null; reasoning_level: AgentSelection['reasoningLevel'] | null; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string; archived_at: string | null; purge_after: string | null };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
 function objectData(value: unknown): Record<string, unknown> | undefined {
@@ -118,6 +118,8 @@ export class Store {
     if (!migratedJobColumns.some((column) => column.name === 'proposed_repository_ids')) this.db.exec("ALTER TABLE jobs ADD COLUMN proposed_repository_ids TEXT NOT NULL DEFAULT '[]'");
     if (!migratedJobColumns.some((column) => column.name === 'model')) this.db.exec("ALTER TABLE jobs ADD COLUMN model TEXT NOT NULL DEFAULT ''");
     if (!migratedJobColumns.some((column) => column.name === 'reasoning_level')) this.db.exec('ALTER TABLE jobs ADD COLUMN reasoning_level TEXT');
+    if (!migratedJobColumns.some((column) => column.name === 'archived_at')) this.db.exec('ALTER TABLE jobs ADD COLUMN archived_at TEXT');
+    if (!migratedJobColumns.some((column) => column.name === 'purge_after')) this.db.exec('ALTER TABLE jobs ADD COLUMN purge_after TEXT');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS job_requested_repositories (job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, repository_id TEXT NOT NULL REFERENCES repositories(id), PRIMARY KEY(job_id,repository_id));
       INSERT OR IGNORE INTO job_requested_repositories SELECT job_id, repository_id FROM job_repositories;
@@ -126,6 +128,7 @@ export class Store {
       UPDATE jobs SET thread_id = id WHERE thread_id IS NULL OR thread_id = '';
       CREATE INDEX IF NOT EXISTS jobs_thread_created ON jobs(thread_id, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS jobs_follow_up_request ON jobs(parent_job_id, follow_up_request_id) WHERE follow_up_request_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS jobs_archive_purge ON jobs(archived_at, purge_after);
     `);
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
@@ -219,15 +222,15 @@ export class Store {
     return this.getJob(id)!;
   }
 
-  getJob(id: string): Job | undefined {
-    const row = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as unknown as JobRow | undefined;
+  getJob(id: string, includeArchived = false): Job | undefined {
+    const row = this.db.prepare(`SELECT * FROM jobs WHERE id = ? ${includeArchived ? '' : 'AND archived_at IS NULL'}`).get(id) as unknown as JobRow | undefined;
     return row ? this.mapJob(row) : undefined;
   }
 
   listJobs(projectId?: string): Job[] {
     const rows = (projectId
-      ? this.db.prepare('SELECT * FROM jobs WHERE project_id = ? ORDER BY created_at DESC').all(projectId)
-      : this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC').all()) as unknown as JobRow[];
+      ? this.db.prepare('SELECT * FROM jobs WHERE project_id = ? AND archived_at IS NULL ORDER BY created_at DESC').all(projectId)
+      : this.db.prepare('SELECT * FROM jobs WHERE archived_at IS NULL ORDER BY created_at DESC').all()) as unknown as JobRow[];
     return rows.map((row) => this.mapJob(row));
   }
 
@@ -257,7 +260,7 @@ export class Store {
       proposedRepositoryIds: proposed.length ? proposed : undefined,
       selectedRepositoryIds: selected.length ? selected.map((x) => x.repository_id) : requested.map((x) => x.repository_id), parentJobId: row.parent_job_id ?? undefined,
       threadId: row.thread_id ?? row.id,
-      createdAt: row.created_at, updatedAt: row.updated_at, finalResponse, usage,
+      createdAt: row.created_at, updatedAt: row.updated_at, archivedAt: row.archived_at ?? undefined, purgeAfter: row.purge_after ?? undefined, finalResponse, usage,
       repositoryResults: repositoryResults.length ? repositoryResults : undefined, error, question,
     };
     if (row.conversation_context) Object.defineProperty(job, 'conversationContext', { value: row.conversation_context, enumerable: false });
@@ -296,11 +299,71 @@ export class Store {
     return rows.map((row) => this.mapJob(row));
   }
 
+  archivedThreads(now = new Date().toISOString()): ArchivedThread[] {
+    const rows = this.db.prepare(`SELECT thread_id, project_id,
+      (SELECT prompt FROM jobs first WHERE first.thread_id=jobs.thread_id ORDER BY created_at,rowid LIMIT 1) title,
+      COUNT(*) run_count, MIN(archived_at) archived_at, MIN(purge_after) purge_after,
+      (SELECT status FROM jobs latest WHERE latest.thread_id=jobs.thread_id ORDER BY created_at DESC,rowid DESC LIMIT 1) latest_status
+      FROM jobs WHERE archived_at IS NOT NULL AND purge_after > ? GROUP BY thread_id, project_id ORDER BY archived_at DESC`).all(now) as unknown as Array<{ thread_id: string; project_id: string; title: string; run_count: number; archived_at: string; purge_after: string; latest_status: JobStatus }>;
+    return rows.map((row) => ({ threadId: row.thread_id, projectId: row.project_id, title: row.title, runCount: Number(row.run_count), archivedAt: row.archived_at, purgeAfter: row.purge_after, latestStatus: row.latest_status }));
+  }
+
+  threadActiveJobIds(jobId: string): string[] | undefined {
+    const row = this.db.prepare('SELECT thread_id FROM jobs WHERE id=?').get(jobId) as { thread_id: string } | undefined;
+    if (!row) return undefined;
+    return (this.db.prepare("SELECT id FROM jobs WHERE thread_id=? AND archived_at IS NULL AND status IN ('queued','running','needs_input')").all(row.thread_id) as Array<{ id: string }>).map((item) => item.id);
+  }
+
+  archiveThread(jobId: string, nowMs = Date.now()): { thread?: ArchivedThread; conflict?: string } {
+    const row = this.db.prepare('SELECT thread_id FROM jobs WHERE id=?').get(jobId) as { thread_id: string } | undefined;
+    if (!row) return { conflict: 'not_found' };
+    const existing = this.db.prepare('SELECT 1 FROM jobs WHERE thread_id=? AND archived_at IS NOT NULL LIMIT 1').get(row.thread_id);
+    if (!existing) {
+      if ((this.threadActiveJobIds(jobId) ?? []).length) return { conflict: 'active' };
+      const archivedAt = new Date(nowMs).toISOString();
+      const purgeAfter = new Date(nowMs + 7 * 86_400_000).toISOString();
+      this.db.prepare('UPDATE jobs SET archived_at=?,purge_after=? WHERE thread_id=?').run(archivedAt, purgeAfter, row.thread_id);
+    }
+    return { thread: this.archivedThreads(new Date(nowMs - 1).toISOString()).find((thread) => thread.threadId === row.thread_id) };
+  }
+
+  restoreThread(jobId: string, nowMs = Date.now()): { threadId?: string; conflict?: string } {
+    const row = this.db.prepare('SELECT thread_id,purge_after FROM jobs WHERE id=?').get(jobId) as { thread_id: string; purge_after: string | null } | undefined;
+    if (!row) return { conflict: 'not_found' };
+    if (!row.purge_after) return { threadId: row.thread_id };
+    if (row.purge_after <= new Date(nowMs).toISOString()) return { conflict: 'expired' };
+    this.db.prepare('UPDATE jobs SET archived_at=NULL,purge_after=NULL WHERE thread_id=?').run(row.thread_id);
+    return { threadId: row.thread_id };
+  }
+
+  expiredThreadRuns(nowMs = Date.now()): Array<{ threadId: string; runs: JobRepositoryRun[] }> {
+    const threads = this.db.prepare('SELECT DISTINCT thread_id FROM jobs WHERE archived_at IS NOT NULL AND purge_after <= ?').all(new Date(nowMs).toISOString()) as Array<{ thread_id: string }>;
+    return threads.map(({ thread_id }) => ({ threadId: thread_id, runs: (this.db.prepare('SELECT r.* FROM job_repository_runs r JOIN jobs j ON j.id=r.job_id WHERE j.thread_id=?').all(thread_id) as any[]).map((r) => ({ jobId: r.job_id, repositoryId: r.repository_id, worktreePath: r.worktree_path, sourcePath: r.source_path, branch: r.branch, remoteName: r.remote_name, remoteUrl: r.remote_url, targetBranch: r.target_branch, baseCommitSha: r.base_commit_sha, gitCommonDir: r.git_common_dir })) }));
+  }
+
+  purgeExpiredThread(threadId: string, nowMs = Date.now()): boolean {
+    const ids = (this.db.prepare('SELECT id FROM jobs WHERE thread_id=? AND archived_at IS NOT NULL AND purge_after <= ?').all(threadId, new Date(nowMs).toISOString()) as Array<{ id: string }>).map((row) => row.id);
+    if (!ids.length) return false;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const id of ids) {
+        this.db.prepare('DELETE FROM job_events WHERE job_id=?').run(id);
+        this.db.prepare('DELETE FROM job_repository_runs WHERE job_id=?').run(id);
+        this.db.prepare('DELETE FROM job_repositories WHERE job_id=?').run(id);
+        this.db.prepare('DELETE FROM job_requested_repositories WHERE job_id=?').run(id);
+        if (this.db.prepare('SELECT 1 FROM promotions WHERE job_id=?').get(id)) this.db.prepare("UPDATE jobs SET prompt='[purged archived thread]',conversation_context='',follow_up_request_id=NULL,purge_after=NULL WHERE id=?").run(id);
+        else this.db.prepare('DELETE FROM jobs WHERE id=?').run(id);
+      }
+      this.db.exec('COMMIT'); return true;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+
   createFollowUp(parentId: string, message: string, requestId: string, scopeMode?: ScopeMode, requestedRepositoryIds?: string[], selection?: AgentSelection): { job?: Job; conflict?: string } {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const parentRow = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(parentId) as unknown as JobRow | undefined;
       if (!parentRow) { this.db.exec('ROLLBACK'); return { conflict: 'not_found' }; }
+      if (parentRow.archived_at) { this.db.exec('ROLLBACK'); return { conflict: 'archived' }; }
       const duplicate = this.db.prepare('SELECT * FROM jobs WHERE parent_job_id = ? AND follow_up_request_id = ?').get(parentId, requestId) as unknown as JobRow | undefined;
       if (duplicate) { this.db.exec('COMMIT'); return { job: this.mapJob(duplicate) }; }
       if (!['done', 'failed', 'cancelled'].includes(parentRow.status)) { this.db.exec('ROLLBACK'); return { conflict: 'parent_active' }; }
@@ -341,7 +404,7 @@ export class Store {
   }
 
   nextQueuedJob(): Job | undefined {
-    const row = this.db.prepare("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1").get() as unknown as JobRow | undefined;
+    const row = this.db.prepare("SELECT * FROM jobs WHERE status = 'queued' AND archived_at IS NULL ORDER BY created_at LIMIT 1").get() as unknown as JobRow | undefined;
     return row ? this.mapJob(row) : undefined;
   }
 
@@ -351,7 +414,7 @@ export class Store {
   }
 
   claim(id: string): boolean {
-    const result = this.db.prepare("UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'queued'").run(new Date().toISOString(), id);
+    const result = this.db.prepare("UPDATE jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'queued' AND archived_at IS NULL").run(new Date().toISOString(), id);
     return Number(result.changes) === 1;
   }
 

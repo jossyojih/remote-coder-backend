@@ -54,12 +54,19 @@ export interface Job {
   conversationContext?: string;
   createdAt: string;
   updatedAt: string;
+  archivedAt?: string;
+  purgeAfter?: string;
   finalResponse?: string;
   usage?: Record<string, unknown>;
   repositoryResults?: Array<Record<string, unknown>>;
   error?: string;
   question?: string;
   repositoryScopeCandidates?: Array<{ repositoryId: string; repositoryName: string; role: string }>;
+}
+
+export interface ArchivedThread {
+  threadId: string; projectId: string; title: string; runCount: number;
+  archivedAt: string; purgeAfter: string; latestStatus: JobStatus;
 }
 
 export type AgentEventEmitter = (type: string, message: string, data?: unknown) => void;

@@ -170,6 +170,38 @@ test('safely migrates existing jobs into root threads', () => {
   old.close(); const store = new Store(path);
   assert.equal(store.getJob('job')?.threadId, 'job');
   const columns = store.db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>;
-  assert.ok(['parent_job_id', 'thread_id', 'conversation_context', 'follow_up_request_id'].every((name) => columns.some((column) => column.name === name)));
+  assert.ok(['parent_job_id', 'thread_id', 'conversation_context', 'follow_up_request_id', 'archived_at', 'purge_after'].every((name) => columns.some((column) => column.name === name)));
+  store.close();
+});
+
+test('archives a whole thread idempotently and restores it during the grace period', async () => {
+  const { app, root } = await fixture(500); const p = await project(app, root);
+  const created = (await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: p.id, prompt: 'Archive me', selectedRepositoryIds: [p.repositories[0].id] } })).json();
+  const needsConfirmation = await app.inject({ method: 'POST', url: `/threads/${created.id}/archive`, headers: auth, payload: {} });
+  assert.equal(needsConfirmation.statusCode, 409); assert.equal(needsConfirmation.json().code, 'active_confirmation_required');
+  const archived = await app.inject({ method: 'POST', url: `/threads/${created.id}/archive`, headers: auth, payload: { confirmActive: true } });
+  assert.equal(archived.statusCode, 200); assert.equal(archived.json().threadId, created.id);
+  assert.equal((await app.inject({ url: '/jobs', headers: auth })).json().length, 0);
+  assert.equal((await app.inject({ url: `/jobs/${created.id}`, headers: auth })).statusCode, 404);
+  const repeated = await app.inject({ method: 'POST', url: `/threads/${created.id}/archive`, headers: auth, payload: { confirmActive: true } });
+  assert.equal(repeated.json().archivedAt, archived.json().archivedAt);
+  assert.equal((await app.inject({ url: '/threads/archived', headers: auth })).json().length, 1);
+  assert.equal((await app.inject({ method: 'POST', url: `/threads/${created.id}/restore`, headers: auth })).statusCode, 200);
+  assert.equal((await app.inject({ method: 'POST', url: `/threads/${created.id}/restore`, headers: auth })).statusCode, 200);
+  assert.equal((await app.inject({ url: '/jobs', headers: auth })).json().length, 1);
+});
+
+test('purges expired archived thread data idempotently', () => {
+  const store = new Store(':memory:');
+  const project = store.createProject('P', [{ name: 'repo', path: '/bounded/source' }]);
+  const job = store.createJob(project.id, 'Sensitive prompt', [project.repositories[0].id], 'mock', 'manual');
+  store.setStatus(job.id, 'cancelled');
+  store.addEvent(job.id, 'result', 'Sensitive event');
+  store.recordRepositoryRun({ jobId: job.id, repositoryId: project.repositories[0].id, worktreePath: '/bounded/run', sourcePath: '/bounded/source', branch: 'job', remoteName: 'origin', remoteUrl: 'git@example/repo', targetBranch: 'main', baseCommitSha: 'abc', gitCommonDir: '/bounded/source/.git' });
+  assert.ok(store.archiveThread(job.id, 1_000).thread);
+  assert.equal(store.purgeExpiredThread(job.id, 1_000 + 7 * 86_400_000), true);
+  assert.equal(store.getJob(job.id, true), undefined);
+  assert.equal(store.repositoryRuns(job.id).length, 0);
+  assert.equal(store.purgeExpiredThread(job.id, 1_000 + 8 * 86_400_000), false);
   store.close();
 });
