@@ -8,6 +8,7 @@ import { runCommand } from './agent-runtime.js';
 export interface MaintenanceConfig {
   runsRoot: string;
   intervalMs: number;
+  startupDelayMs: number;
   terminalGracePeriodMs: number;
   failedRetentionMs: number;
   diskWarningThreshold: number;
@@ -140,6 +141,8 @@ export class MaintenanceService {
     retainedWorktreeCount: 0,
   };
   private timer?: NodeJS.Timeout;
+  private startupTimer?: NodeJS.Timeout;
+  private started = false;
   private running = false;
   private cleanupHistory: CleanupResult[] = [];
   private failureHistory: CleanupFailure[] = [];
@@ -149,11 +152,19 @@ export class MaintenanceService {
     private readonly config: MaintenanceConfig,
     private readonly log: FastifyBaseLogger,
     private readonly now: () => number = Date.now,
+    private readonly maintenanceRunOverride?: () => Promise<void>,
   ) {}
 
-  async start(): Promise<void> {
-    this.log.info({ intervalMs: this.config.intervalMs }, 'maintenance scheduler starting');
-    await this.runMaintenance();
+  start(): void {
+    if (this.started) return;
+    this.started = true;
+    this.log.info({ intervalMs: this.config.intervalMs, startupDelayMs: this.config.startupDelayMs }, 'maintenance scheduler starting');
+
+    this.startupTimer = setTimeout(() => {
+      this.startupTimer = undefined;
+      void this.runMaintenance();
+    }, this.config.startupDelayMs);
+    this.startupTimer.unref();
 
     this.timer = setInterval(() => {
       void this.runMaintenance();
@@ -163,6 +174,11 @@ export class MaintenanceService {
   }
 
   stop(): void {
+    this.started = false;
+    if (this.startupTimer) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = undefined;
+    }
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
@@ -226,9 +242,13 @@ export class MaintenanceService {
     this.status.lastRunAt = new Date(this.now()).toISOString();
 
     try {
-      await this.purgeExpiredArchives();
-      await this.cleanupWorktrees();
-      await this.updateStorageMetrics();
+      if (this.maintenanceRunOverride) {
+        await this.maintenanceRunOverride();
+      } else {
+        if (this.config.cleanupEnabled) await this.purgeExpiredArchives();
+        await this.cleanupWorktrees();
+        await this.updateStorageMetrics();
+      }
 
       this.status.lastRunCompletedAt = new Date(this.now()).toISOString();
       this.log.info({
@@ -236,8 +256,8 @@ export class MaintenanceService {
         failed: this.status.lastFailedCount,
         totalReclaimed: this.status.totalReclaimedBytes,
       }, 'maintenance completed');
-    } catch (error) {
-      this.log.error({ err: error }, 'maintenance run failed');
+    } catch {
+      this.log.error({ errorCode: 'MAINTENANCE_RUN_FAILED' }, 'maintenance run failed');
     } finally {
       this.running = false;
       this.status.isRunning = false;

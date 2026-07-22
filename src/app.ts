@@ -48,6 +48,8 @@ export interface AppOptions {
   deploymentApiToken?: string;
   deploymentStarter?: DeploymentStarter;
   maintenanceIntervalMs?: number;
+  maintenanceStartupDelayMs?: number;
+  maintenanceRunOverride?: () => Promise<void>;
   terminalGracePeriodMs?: number;
   failedRetentionMs?: number;
   diskWarningThreshold?: number;
@@ -385,6 +387,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     {
       runsRoot: absoluteRunsRoot,
       intervalMs: options.maintenanceIntervalMs ?? Number(process.env.MAINTENANCE_INTERVAL_MS ?? 12 * 60 * 60 * 1000),
+      startupDelayMs: options.maintenanceStartupDelayMs ?? Number(process.env.MAINTENANCE_STARTUP_DELAY_MS ?? 10_000),
       terminalGracePeriodMs: options.terminalGracePeriodMs ?? Number(process.env.TERMINAL_GRACE_PERIOD_MS ?? 24 * 60 * 60 * 1000),
       failedRetentionMs: options.failedRetentionMs ?? Number(process.env.FAILED_RETENTION_MS ?? 7 * 24 * 60 * 60 * 1000),
       diskWarningThreshold: options.diskWarningThreshold ?? Number(process.env.DISK_WARNING_THRESHOLD ?? 0.85),
@@ -393,9 +396,10 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     },
     app.log,
     now,
+    options.maintenanceRunOverride,
   );
 
-  await maintenance.start();
+  app.addHook('onListen', async () => { maintenance.start(); });
   app.addHook('onClose', async () => { maintenance.stop(); await worker.stop(); store.close(); });
   worker.start();
   return { app, store, worker, maintenance };

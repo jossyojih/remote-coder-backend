@@ -1,6 +1,6 @@
 import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execSync } from 'node:child_process';
@@ -58,6 +58,7 @@ describe('MaintenanceService', () => {
       {
         runsRoot,
         intervalMs: overrides.intervalMs ?? 12 * 60 * 60 * 1000,
+        startupDelayMs: 10_000,
         terminalGracePeriodMs: overrides.terminalGracePeriodMs ?? 24 * 60 * 60 * 1000,
         failedRetentionMs: overrides.failedRetentionMs ?? 7 * 24 * 60 * 60 * 1000,
         diskWarningThreshold: 0.85,
@@ -354,6 +355,20 @@ describe('MaintenanceService', () => {
 
     const status = maintenance.getStatus();
     assert.equal(status.lastCleanedCount, 0, 'no worktrees should be cleaned when disabled');
+  });
+
+  it('should not purge expired archived worktrees when cleanup is disabled', async () => {
+    const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
+    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    store.archiveThread(jobId, nowValue);
+    nowValue += 8 * 24 * 60 * 60 * 1000;
+
+    const maintenance = createTestMaintenance({ cleanupEnabled: false });
+    await maintenance.triggerMaintenance();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.ok(existsSync(worktreePath), 'archived worktree should remain when cleanup is disabled');
+    assert.ok(store.getJob(jobId, true), 'archived thread data should remain when cleanup is disabled');
   });
 
   it('should delete worktrees when cleanup is enabled', async () => {

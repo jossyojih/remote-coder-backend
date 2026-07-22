@@ -32,6 +32,56 @@ test('health is public and other endpoints require bearer authentication', async
   assert.equal((await app.inject({ url: '/projects', headers: auth })).statusCode, 200);
 });
 
+test('serves health promptly while delayed startup maintenance is still running', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'command-center-health-'));
+  let releaseMaintenance!: () => void;
+  const slowMaintenance = new Promise<void>((resolve) => { releaseMaintenance = resolve; });
+  let maintenanceStarted!: () => void;
+  const started = new Promise<void>((resolve) => { maintenanceStarted = resolve; });
+  const { app, maintenance } = await buildApp({
+    databasePath: join(root, 'test.sqlite'),
+    workspaceRoot: root,
+    apiToken: token,
+    maintenanceStartupDelayMs: 1,
+    maintenanceRunOverride: async () => {
+      maintenanceStarted();
+      await slowMaintenance;
+    },
+  });
+  apps.push(app);
+
+  await app.ready();
+  maintenance.start();
+  await started;
+  const beforeHealth = Date.now();
+  const response = await app.inject({ url: '/health' });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json(), { status: 'ok' });
+  assert.ok(Date.now() - beforeHealth < 250, 'health should not wait for maintenance');
+  releaseMaintenance();
+});
+
+test('scheduled maintenance still runs after startup', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'command-center-scheduler-'));
+  let runs = 0;
+  const { app, maintenance } = await buildApp({
+    databasePath: join(root, 'test.sqlite'),
+    workspaceRoot: root,
+    apiToken: token,
+    maintenanceStartupDelayMs: 10_000,
+    maintenanceIntervalMs: 10,
+    maintenanceRunOverride: async () => { runs++; },
+  });
+  apps.push(app);
+  maintenance.start();
+
+  for (let attempt = 0; attempt < 50 && runs === 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(runs > 0, 'interval should invoke maintenance');
+});
+
 test('validates request bodies and rejects paths outside the workspace', async () => {
   const { app, root } = await fixture();
   assert.equal((await app.inject({ method: 'POST', url: '/projects', headers: auth, payload: { name: '', repositories: [] } })).statusCode, 400);
