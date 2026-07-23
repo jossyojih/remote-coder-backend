@@ -54,6 +54,7 @@ export interface AppOptions {
   failedRetentionMs?: number;
   diskWarningThreshold?: number;
   cleanupBatchLimit?: number;
+  maintenanceCleanupEnabled?: boolean;
 }
 
 export interface CommandCenterApp {
@@ -339,6 +340,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     return {
       lastRunAt: status.lastRunAt,
       lastRunCompletedAt: status.lastRunCompletedAt,
+      nextRunAt: status.nextRunAt,
+      cleanupEnabled: status.cleanupEnabled,
       isRunning: status.isRunning,
       eligibleWorktrees: status.eligibleWorktrees,
       protectedWorktrees: status.protectedWorktrees,
@@ -347,6 +350,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       totalReclaimedBytes: status.totalReclaimedBytes,
       retainedWorktreeCount: status.retainedWorktreeCount,
       retainedWorktreeBytes: status.retainedWorktreeBytes,
+      diskUsageBytes: status.diskUsageBytes,
+      archivedThreads: status.archivedThreads,
     };
   });
 
@@ -369,6 +374,9 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
 
   app.post('/maintenance/cleanup', async (request, reply) => {
     const result = await maintenance.triggerMaintenance();
+    if (result.disabled) {
+      return reply.code(403).send({ error: 'Maintenance cleanup is disabled by server policy' });
+    }
     if (!result.started) {
       return reply.code(409).send({ error: 'Maintenance is already running' });
     }
@@ -377,8 +385,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
 
   app.get('/maintenance/history', async () => {
     return {
-      cleaned: maintenance.getCleanupHistory(20),
-      failed: maintenance.getFailureHistory(20),
+      cleaned: maintenance.getCleanupHistory(20).map(({ worktreePath: _path, ...item }) => item),
+      failed: maintenance.getFailureHistory(20).map(({ worktreePath: _path, ...item }) => item),
     };
   });
 
@@ -392,7 +400,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       failedRetentionMs: options.failedRetentionMs ?? Number(process.env.FAILED_RETENTION_MS ?? 7 * 24 * 60 * 60 * 1000),
       diskWarningThreshold: options.diskWarningThreshold ?? Number(process.env.DISK_WARNING_THRESHOLD ?? 0.85),
       batchLimit: options.cleanupBatchLimit ?? Number(process.env.CLEANUP_BATCH_LIMIT ?? 50),
-      cleanupEnabled: process.env.MAINTENANCE_CLEANUP_ENABLED === 'true',
+      cleanupEnabled: options.maintenanceCleanupEnabled ?? process.env.MAINTENANCE_CLEANUP_ENABLED === 'true',
     },
     app.log,
     now,

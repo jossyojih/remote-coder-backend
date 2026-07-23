@@ -32,6 +32,36 @@ test('health is public and other endpoints require bearer authentication', async
   assert.equal((await app.inject({ url: '/projects', headers: auth })).statusCode, 200);
 });
 
+test('maintenance APIs enforce cleanup policy and never expose worktree paths', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'command-center-maintenance-api-'));
+  const { app, maintenance } = await buildApp({
+    databasePath: join(root, 'test.sqlite'),
+    workspaceRoot: root,
+    runsRoot: root,
+    apiToken: token,
+    maintenanceCleanupEnabled: false,
+  });
+  apps.push(app);
+
+  const statusResponse = await app.inject({ url: '/maintenance/status', headers: auth });
+  assert.equal(statusResponse.statusCode, 200);
+  assert.equal(statusResponse.json().cleanupEnabled, false);
+  assert.equal((await app.inject({ method: 'POST', url: '/maintenance/cleanup', headers: auth })).statusCode, 403);
+  assert.equal((await app.inject({ url: '/maintenance/status' })).statusCode, 401);
+
+  const internal = maintenance as unknown as {
+    cleanupHistory: Array<Record<string, unknown>>;
+    failureHistory: Array<Record<string, unknown>>;
+  };
+  internal.cleanupHistory.push({ jobId: 'job', repositoryId: 'repo', worktreePath: '/secret/run', reason: 'eligible', reclaimedBytes: 1, cleanedAt: new Date().toISOString() });
+  internal.failureHistory.push({ jobId: 'job', repositoryId: 'repo', worktreePath: '/secret/run', reason: 'eligible', errorCode: 'cleanup_failed', failedAt: new Date().toISOString() });
+
+  const history = (await app.inject({ url: '/maintenance/history', headers: auth })).json();
+  assert.equal(history.cleaned[0].worktreePath, undefined);
+  assert.equal(history.failed[0].worktreePath, undefined);
+  assert.doesNotMatch(JSON.stringify(history), /secret\/run/);
+});
+
 test('serves health promptly while delayed startup maintenance is still running', async () => {
   const root = mkdtempSync(join(tmpdir(), 'command-center-health-'));
   let releaseMaintenance!: () => void;

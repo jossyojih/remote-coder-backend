@@ -17,8 +17,10 @@ export interface MaintenanceConfig {
 }
 
 export interface MaintenanceStatus {
+  cleanupEnabled: boolean;
   lastRunAt?: string;
   lastRunCompletedAt?: string;
+  nextRunAt?: string;
   isRunning: boolean;
   eligibleWorktrees: number;
   protectedWorktrees: number;
@@ -26,6 +28,7 @@ export interface MaintenanceStatus {
   lastFailedCount: number;
   totalReclaimedBytes: number;
   diskUsageBytes?: number;
+  archivedThreads: number;
   retainedWorktreeCount: number;
   retainedWorktreeBytes?: number;
 }
@@ -132,12 +135,14 @@ async function removeWorktree(worktreePath: string, sourcePath: string, runsRoot
 
 export class MaintenanceService {
   private status: MaintenanceStatus = {
+    cleanupEnabled: false,
     isRunning: false,
     eligibleWorktrees: 0,
     protectedWorktrees: 0,
     lastCleanedCount: 0,
     lastFailedCount: 0,
     totalReclaimedBytes: 0,
+    archivedThreads: 0,
     retainedWorktreeCount: 0,
   };
   private timer?: NodeJS.Timeout;
@@ -153,11 +158,14 @@ export class MaintenanceService {
     private readonly log: FastifyBaseLogger,
     private readonly now: () => number = Date.now,
     private readonly maintenanceRunOverride?: () => Promise<void>,
-  ) {}
+  ) {
+    this.status.cleanupEnabled = config.cleanupEnabled;
+  }
 
   start(): void {
     if (this.started) return;
     this.started = true;
+    this.status.nextRunAt = new Date(this.now() + this.config.startupDelayMs).toISOString();
     this.log.info({ intervalMs: this.config.intervalMs, startupDelayMs: this.config.startupDelayMs }, 'maintenance scheduler starting');
 
     this.startupTimer = setTimeout(() => {
@@ -175,6 +183,7 @@ export class MaintenanceService {
 
   stop(): void {
     this.started = false;
+    this.status.nextRunAt = undefined;
     if (this.startupTimer) {
       clearTimeout(this.startupTimer);
       this.startupTimer = undefined;
@@ -190,7 +199,10 @@ export class MaintenanceService {
     return { ...this.status };
   }
 
-  async triggerMaintenance(): Promise<{ started: boolean }> {
+  async triggerMaintenance(): Promise<{ started: boolean; disabled?: boolean }> {
+    if (!this.config.cleanupEnabled) {
+      return { started: false, disabled: true };
+    }
     if (this.running) {
       return { started: false };
     }
@@ -240,6 +252,7 @@ export class MaintenanceService {
     this.running = true;
     this.status.isRunning = true;
     this.status.lastRunAt = new Date(this.now()).toISOString();
+    this.status.nextRunAt = new Date(this.now() + this.config.intervalMs).toISOString();
 
     try {
       if (this.maintenanceRunOverride) {
@@ -454,6 +467,7 @@ export class MaintenanceService {
   private async updateStorageMetrics(): Promise<void> {
     const runs = this.store.allRepositoryRuns();
     this.status.retainedWorktreeCount = runs.length;
+    this.status.archivedThreads = this.store.archivedThreads(new Date(this.now()).toISOString()).length;
 
     try {
       let totalBytes = 0;
@@ -467,12 +481,7 @@ export class MaintenanceService {
       }
       this.status.retainedWorktreeBytes = totalBytes;
 
-      try {
-        const runsRootStats = await stat(this.config.runsRoot);
-        this.status.diskUsageBytes = runsRootStats.size;
-      } catch {
-        // Disk usage unavailable
-      }
+      this.status.diskUsageBytes = await dirSize(this.config.runsRoot);
     } catch (error) {
       this.log.debug({ err: error }, 'failed to update storage metrics');
     }
