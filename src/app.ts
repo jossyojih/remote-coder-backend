@@ -358,6 +358,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.get('/maintenance/preview', async () => {
     const preview = await maintenance.previewCleanup();
     return {
+      retainedWorktreeCount: preview.retainedWorktreeCount,
+      classifiedWorktreeCount: preview.classifiedWorktreeCount,
       eligible: preview.eligible.map((item) => ({
         jobId: item.jobId,
         repositoryId: item.repositoryId,

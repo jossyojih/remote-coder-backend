@@ -353,7 +353,51 @@ describe('MaintenanceService', () => {
     const preview = await maintenance.previewCleanup();
 
     const archived = preview.protectedWorktrees.find((p) => p.jobId === jobId);
-    assert.ok(!archived, 'archived thread worktrees are handled separately by purgeExpiredArchives');
+    assert.ok(archived, 'archived retained worktrees must remain visible in the preview');
+    assert.match(archived.reason, /archived thread/i);
+  });
+
+  it('classifies registered, unregistered, unsafe, and unverifiable retained worktrees and reconciles counts', async () => {
+    const registeredProject = store.createProject('Registered', [{ name: 'Backend', path: backendSource }]);
+    await createJobWithWorktree(registeredProject.repositories[0]!.id, backendSource, 'done');
+
+    const cases = [
+      { name: 'unregistered', worktreePath: join(runsRoot, `unregistered-reconcile-${Date.now()}`), sourcePath: backendSource },
+      { name: 'unsafe', worktreePath: join(testRoot, `escaped-reconcile-${Date.now()}`), sourcePath: backendSource },
+      { name: 'unknown', worktreePath: join(runsRoot, `missing-reconcile-${Date.now()}`), sourcePath: join(workspaceRoot, 'missing-source') },
+    ];
+    mkdirSync(cases[0]!.worktreePath);
+    await git(cases[0]!.worktreePath, ['init']);
+    mkdirSync(cases[1]!.worktreePath);
+
+    for (const item of cases) {
+      const project = store.createProject(item.name, [{ name: item.name, path: backendSource }]);
+      const job = store.createJob(project.id, item.name, [project.repositories[0]!.id], 'mock', 'manual');
+      store.setStatus(job.id, 'done');
+      store.recordRepositoryRun({
+        jobId: job.id,
+        repositoryId: project.repositories[0]!.id,
+        worktreePath: item.worktreePath,
+        sourcePath: item.sourcePath,
+        branch: item.name,
+        remoteName: 'origin',
+        remoteUrl: '',
+        targetBranch: 'main',
+        baseCommitSha: 'unknown',
+        gitCommonDir: join(item.sourcePath, '.git'),
+      });
+    }
+
+    const preview = await createTestMaintenance({ cleanupEnabled: false }).previewCleanup();
+
+    assert.equal(preview.retainedWorktreeCount, 4);
+    assert.equal(preview.classifiedWorktreeCount, 4);
+    assert.equal(preview.eligible.length + preview.protectedWorktrees.length, preview.retainedWorktreeCount);
+    assert.equal(preview.protectedWorktrees.length, 3);
+    assert.ok(preview.protectedWorktrees.every((item) => item.reason.length > 0));
+    assert.ok(preview.protectedWorktrees.some((item) => /not a registered/i.test(item.reason)));
+    assert.ok(preview.protectedWorktrees.some((item) => /outside/i.test(item.reason)));
+    assert.ok(preview.protectedWorktrees.some((item) => /path resolution failed/i.test(item.reason)));
   });
 
   it('should clean cancelled jobs after grace period', async () => {

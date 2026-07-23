@@ -55,6 +55,15 @@ export type CleanupEligibility =
   | { eligible: false; reason: string }
   | { eligible: true; reason: string; reclaimedBytes: number };
 
+const PREVIEW_CLASSIFICATION_TIMEOUT_MS = 10_000;
+
+type PreviewResult = {
+  eligible: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string; estimatedBytes: number }>;
+  protectedWorktrees: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string }>;
+  retainedWorktreeCount: number;
+  classifiedWorktreeCount: number;
+};
+
 function within(parent: string, child: string): boolean {
   const rel = relative(parent, child);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
@@ -224,18 +233,38 @@ export class MaintenanceService {
     return { started: true };
   }
 
-  async previewCleanup(): Promise<{ eligible: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string; estimatedBytes: number }>; protectedWorktrees: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string }> }> {
+  async previewCleanup(): Promise<PreviewResult> {
     const runs = this.store.allRepositoryRuns();
     const eligible: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string; estimatedBytes: number }> = [];
     const protectedWorktrees: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string }> = [];
 
-    for (const run of runs) {
+    const classifications = await Promise.all(runs.map(async (run): Promise<CleanupEligibility> => {
       const job = this.store.getJob(run.jobId, true);
       if (job?.archivedAt) {
-        continue;
+        return { eligible: false, reason: 'archived thread retained until archive purge' };
       }
 
-      const result = await this.checkEligibility(run.jobId, run);
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          this.checkEligibility(run.jobId, run),
+          new Promise<CleanupEligibility>((resolve) => {
+            timer = setTimeout(
+              () => resolve({ eligible: false, reason: 'verification timed out; protected by default' }),
+              PREVIEW_CLASSIFICATION_TIMEOUT_MS,
+            );
+            timer.unref();
+          }),
+        ]);
+      } catch {
+        return { eligible: false, reason: 'verification failed; protected by default' };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }));
+
+    for (const [index, run] of runs.entries()) {
+      const result = classifications[index] ?? { eligible: false as const, reason: 'classification unavailable; protected by default' };
       if (result.eligible) {
         eligible.push({
           jobId: run.jobId,
@@ -254,7 +283,11 @@ export class MaintenanceService {
       }
     }
 
-    return { eligible, protectedWorktrees };
+    const classifiedWorktreeCount = eligible.length + protectedWorktrees.length;
+    this.status.eligibleWorktrees = eligible.length;
+    this.status.protectedWorktrees = protectedWorktrees.length;
+    this.status.retainedWorktreeCount = runs.length;
+    return { eligible, protectedWorktrees, retainedWorktreeCount: runs.length, classifiedWorktreeCount };
   }
 
   private async runMaintenance(): Promise<void> {
