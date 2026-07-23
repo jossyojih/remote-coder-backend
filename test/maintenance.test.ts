@@ -273,6 +273,35 @@ describe('MaintenanceService', () => {
     assert.match(outsideItem.reason, /outside/i);
   });
 
+  it('should protect unregistered git repositories inside runs root', async () => {
+    const unregisteredPath = join(runsRoot, `unregistered-${Date.now()}`);
+    mkdirSync(unregisteredPath);
+    await git(unregisteredPath, ['init']);
+
+    const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
+    const job = store.createJob(project.id, 'Test', [project.repositories[0]!.id], 'mock', 'manual');
+    store.setStatus(job.id, 'done');
+    store.recordRepositoryRun({
+      jobId: job.id,
+      repositoryId: project.repositories[0]!.id,
+      worktreePath: unregisteredPath,
+      sourcePath: backendSource,
+      branch: 'not-registered',
+      remoteName: 'origin',
+      remoteUrl: '',
+      targetBranch: 'main',
+      baseCommitSha: 'abc',
+      gitCommonDir: join(unregisteredPath, '.git'),
+    });
+
+    const maintenance = createTestMaintenance();
+    const preview = await maintenance.previewCleanup();
+
+    const unregisteredItem = preview.protectedWorktrees.find((p) => p.jobId === job.id);
+    assert.ok(unregisteredItem, 'unregistered repository should be protected');
+    assert.match(unregisteredItem.reason, /not a registered git worktree/i);
+  });
+
   it('should prevent concurrent maintenance runs', async () => {
     const maintenance = createTestMaintenance({ intervalMs: 100 });
 

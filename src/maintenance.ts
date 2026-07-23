@@ -79,12 +79,26 @@ async function dirSize(path: string): Promise<number> {
   }
 }
 
-async function isGitWorktree(path: string, runsRoot: string): Promise<boolean> {
+async function isRegisteredGitWorktree(path: string, sourcePath: string, runsRoot: string): Promise<boolean> {
   try {
     const resolved = realpathSync(path);
     if (!within(realpathSync(runsRoot), resolved)) return false;
-    const result = await runCommand('git', ['rev-parse', '--is-inside-work-tree'], path);
-    return result.stdout.trim() === 'true';
+    const commonDir = resolve(path, (await runCommand('git', ['rev-parse', '--git-common-dir'], path)).stdout.trim());
+    const sourceCommonDir = resolve(sourcePath, (await runCommand('git', ['rev-parse', '--git-common-dir'], sourcePath)).stdout.trim());
+    if (realpathSync(commonDir) !== realpathSync(sourceCommonDir)) return false;
+
+    const listed = await runCommand('git', ['worktree', 'list', '--porcelain'], sourcePath);
+    const registeredPaths = listed.stdout
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('worktree '))
+      .map((line) => line.slice('worktree '.length));
+    return registeredPaths.some((registeredPath) => {
+      try {
+        return realpathSync(registeredPath) === resolved;
+      } catch {
+        return false;
+      }
+    });
   } catch {
     return false;
   }
@@ -289,8 +303,13 @@ export class MaintenanceService {
           safeToPurge = false;
           continue;
         }
+        if (!await isRegisteredGitWorktree(run.worktreePath, run.sourcePath, this.config.runsRoot)) {
+          this.log.error({ threadId: expired.threadId, worktreePath: run.worktreePath }, 'refusing to purge unregistered archived worktree');
+          safeToPurge = false;
+          continue;
+        }
         try {
-          await rm(target, { recursive: true, force: true });
+          await removeWorktree(run.worktreePath, run.sourcePath, this.config.runsRoot, this.log);
         } catch (error) {
           this.log.error({ threadId: expired.threadId, worktreePath: run.worktreePath, err: error }, 'failed to remove archived worktree');
           safeToPurge = false;
@@ -388,8 +407,8 @@ export class MaintenanceService {
         return { eligible: false, reason: 'worktree is source repository' };
       }
 
-      if (!await isGitWorktree(run.worktreePath, this.config.runsRoot)) {
-        return { eligible: false, reason: 'not a valid git worktree' };
+      if (!await isRegisteredGitWorktree(run.worktreePath, run.sourcePath, this.config.runsRoot)) {
+        return { eligible: false, reason: 'not a registered git worktree' };
       }
     } catch {
       return { eligible: false, reason: 'path resolution failed' };
