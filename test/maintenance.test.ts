@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Store } from '../src/database.js';
 import { MaintenanceService } from '../src/maintenance.js';
 
-function git(...args: string[]) {
-  return execSync(`git ${args.join(' ')}`, { encoding: 'utf8' });
+const execFileAsync = promisify(execFile);
+
+async function git(cwd: string, args: string[]) {
+  return (await execFileAsync('git', args, { cwd, encoding: 'utf8' })).stdout;
 }
 
 describe('MaintenanceService', () => {
@@ -20,7 +23,7 @@ describe('MaintenanceService', () => {
   let frontendSource: string;
   let nowValue = Date.now();
 
-  before(() => {
+  before(async () => {
     testRoot = mkdtempSync(join(tmpdir(), 'maintenance-test-'));
     workspaceRoot = join(testRoot, 'workspace');
     runsRoot = join(testRoot, 'runs');
@@ -32,13 +35,13 @@ describe('MaintenanceService', () => {
 
     for (const source of [backendSource, frontendSource]) {
       mkdirSync(source);
-      git(`-C ${source} init`);
-      git(`-C ${source} config user.name "Test"`);
-      git(`-C ${source} config user.email "test@example.com"`);
+      await git(source, ['init']);
+      await git(source, ['config', 'user.name', 'Test']);
+      await git(source, ['config', 'user.email', 'test@example.com']);
       writeFileSync(join(source, 'README.md'), '# Project\n');
-      git(`-C ${source} add -A`);
-      git(`-C ${source} commit -m "initial"`);
-      git(`-C ${source} branch -M main`);
+      await git(source, ['add', '-A']);
+      await git(source, ['commit', '-m', 'initial']);
+      await git(source, ['branch', '-M', 'main']);
     }
   });
 
@@ -70,21 +73,26 @@ describe('MaintenanceService', () => {
     );
   }
 
-  function createJobWithWorktree(repositoryId: string, sourcePath: string, status: 'queued' | 'running' | 'needs_input' | 'done' | 'failed' | 'cancelled' = 'done'): { jobId: string; worktreePath: string } {
+  async function createJobWithWorktree(repositoryId: string, sourcePath: string, status: 'queued' | 'running' | 'needs_input' | 'done' | 'failed' | 'cancelled' = 'done'): Promise<{ jobId: string; worktreePath: string }> {
     const project = store.createProject('Test Project', [{ name: 'Repo', path: sourcePath }]);
     const job = store.createJob(project.id, 'Test prompt', [repositoryId ?? project.repositories[0]!.id], 'mock', 'manual');
 
     const worktreePath = join(runsRoot, `worktree-${job.id}-${repositoryId}`);
     mkdirSync(worktreePath, { recursive: true });
 
-    git(`-C ${sourcePath} worktree add ${worktreePath} -b remote-engineer/${job.id}`);
+    await git(sourcePath, ['worktree', 'add', worktreePath, '-b', `remote-engineer/${job.id}`]);
     writeFileSync(join(worktreePath, 'test.txt'), 'test content\n');
-    git(`-C ${worktreePath} add test.txt`);
-    git(`-C ${worktreePath} commit -m "test commit"`);
+    await git(worktreePath, ['add', 'test.txt']);
+    await git(worktreePath, ['commit', '-m', 'test commit']);
 
-    const baseCommit = git(`-C ${worktreePath} rev-parse HEAD`).trim();
-    const remoteUrl = git(`-C ${worktreePath} remote get-url origin || echo "none"`).trim();
-    const gitCommonDir = resolve(worktreePath, git(`-C ${worktreePath} rev-parse --git-common-dir`).trim());
+    const baseCommit = (await git(worktreePath, ['rev-parse', 'HEAD'])).trim();
+    let remoteUrl = '';
+    try {
+      remoteUrl = (await git(worktreePath, ['remote', 'get-url', 'origin'])).trim();
+    } catch {
+      // The temporary repositories intentionally have no remote.
+    }
+    const gitCommonDir = resolve(worktreePath, (await git(worktreePath, ['rev-parse', '--git-common-dir'])).trim());
 
     store.recordRepositoryRun({
       jobId: job.id,
@@ -93,7 +101,7 @@ describe('MaintenanceService', () => {
       sourcePath,
       branch: `remote-engineer/${job.id}`,
       remoteName: 'origin',
-      remoteUrl: remoteUrl === 'none' ? '' : remoteUrl,
+      remoteUrl,
       targetBranch: 'main',
       baseCommitSha: baseCommit,
       gitCommonDir,
@@ -108,7 +116,7 @@ describe('MaintenanceService', () => {
 
   it('should protect active jobs', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'running');
+    const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'running');
 
     const maintenance = createTestMaintenance();
     const preview = await maintenance.previewCleanup();
@@ -120,7 +128,7 @@ describe('MaintenanceService', () => {
 
   it('should clean completed jobs with no changes', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const maintenance = createTestMaintenance();
     const previewBefore = await maintenance.previewCleanup();
@@ -138,11 +146,11 @@ describe('MaintenanceService', () => {
 
   it('should protect pending review jobs', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
-    git(`-C ${worktreePath} add -A`);
+    await git(worktreePath, ['add', '-A']);
     writeFileSync(join(worktreePath, 'new-file.txt'), 'new content\n');
-    git(`-C ${worktreePath} add new-file.txt`);
+    await git(worktreePath, ['add', 'new-file.txt']);
 
     const maintenance = createTestMaintenance();
     const preview = await maintenance.previewCleanup();
@@ -154,7 +162,7 @@ describe('MaintenanceService', () => {
 
   it('should clean promoted worktrees', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const runs = store.repositoryRuns(jobId);
     store.beginPromotion(jobId, 'Test promotion', runs);
@@ -171,7 +179,7 @@ describe('MaintenanceService', () => {
   it('should respect failed retention period', async () => {
     const shortRetention = 1000;
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'failed');
+    const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'failed');
 
     const maintenance = createTestMaintenance({ failedRetentionMs: shortRetention });
 
@@ -191,7 +199,7 @@ describe('MaintenanceService', () => {
   it('should clean read-only completed jobs', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
     store.updateRepositoryPromotionPolicy(project.id, project.repositories[0]!.id, 'read_only');
-    const { jobId } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const maintenance = createTestMaintenance();
     const preview = await maintenance.previewCleanup();
@@ -203,7 +211,7 @@ describe('MaintenanceService', () => {
 
   it('should protect jobs with active deployments', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const runs = store.repositoryRuns(jobId);
     store.beginPromotion(jobId, 'Test', runs);
@@ -224,7 +232,7 @@ describe('MaintenanceService', () => {
 
     const jobIds: string[] = [];
     for (let i = 0; i < 5; i++) {
-      const { jobId } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+      const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
       jobIds.push(jobId);
     }
 
@@ -277,7 +285,7 @@ describe('MaintenanceService', () => {
 
   it('should update storage metrics', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const maintenance = createTestMaintenance();
     await maintenance.triggerMaintenance();
@@ -290,7 +298,7 @@ describe('MaintenanceService', () => {
 
   it('should maintain cleanup history', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const maintenance = createTestMaintenance();
     await maintenance.triggerMaintenance();
@@ -308,7 +316,7 @@ describe('MaintenanceService', () => {
 
   it('should handle archived threads separately', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     store.archiveThread(jobId, nowValue);
 
@@ -322,7 +330,7 @@ describe('MaintenanceService', () => {
   it('should clean cancelled jobs after grace period', async () => {
     const shortGrace = 1000;
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'cancelled');
+    const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'cancelled');
 
     const maintenance = createTestMaintenance({ terminalGracePeriodMs: shortGrace });
 
@@ -339,7 +347,7 @@ describe('MaintenanceService', () => {
 
   it('should not delete worktrees when cleanup is disabled', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const maintenance = createTestMaintenance({ cleanupEnabled: false });
 
@@ -359,7 +367,7 @@ describe('MaintenanceService', () => {
 
   it('should not purge expired archived worktrees when cleanup is disabled', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId, worktreePath } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
     store.archiveThread(jobId, nowValue);
     nowValue += 8 * 24 * 60 * 60 * 1000;
 
@@ -373,7 +381,7 @@ describe('MaintenanceService', () => {
 
   it('should delete worktrees when cleanup is enabled', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    const { jobId } = createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const maintenance = createTestMaintenance({ cleanupEnabled: true });
     await maintenance.triggerMaintenance();
@@ -388,8 +396,8 @@ describe('MaintenanceService', () => {
 
   it('should still calculate eligibility when cleanup is disabled', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
-    createJobWithWorktree(project.repositories[0]!.id, backendSource, 'running');
+    await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'running');
 
     const maintenance = createTestMaintenance({ cleanupEnabled: false });
     const preview = await maintenance.previewCleanup();
