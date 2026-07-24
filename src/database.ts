@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { AgentSelection, ArchivedThread, Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason } from './types.js';
+import type { AgentSelection, ArchivedThread, Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason, ThreadSearchResult, ThreadSearchFilters } from './types.js';
 
 type ProjectRow = { id: string; name: string; created_at: string; promotion_policy: PromotionPolicy; default_agent: AgentSelection['agent'] | null; default_model: string | null; default_reasoning_level: AgentSelection['reasoningLevel'] | null };
 type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; promotion_policy_override?: PromotionPolicy | null; created_at: string };
@@ -148,8 +148,113 @@ export class Store {
         ORDER BY j.created_at,j.rowid;
       CREATE INDEX IF NOT EXISTS thread_permissions_project ON thread_repository_permissions(thread_id,project_id);
     `);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS jobs_project_thread ON jobs(project_id, thread_id);`);
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
+  }
+
+  searchThreads(filters: ThreadSearchFilters): { results: ThreadSearchResult[]; total: number } {
+    const page = Math.max(1, filters.page ?? 1);
+    const pageSize = Math.min(100, Math.max(1, filters.pageSize ?? 20));
+    const conditions: string[] = [];
+    const params: (string | number | null)[] = [];
+
+    if (!filters.includeArchived) {
+      conditions.push('j.archived_at IS NULL');
+    }
+    if (filters.projectId) {
+      conditions.push('j.project_id = ?');
+      params.push(filters.projectId);
+    }
+    if (filters.agent) {
+      conditions.push('j.agent = ?');
+      params.push(filters.agent);
+    }
+    if (filters.dateFrom) {
+      conditions.push('j.updated_at >= ?');
+      params.push(filters.dateFrom);
+    }
+    if (filters.dateTo) {
+      conditions.push('j.updated_at <= ?');
+      params.push(filters.dateTo);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const baseQuery = `
+      SELECT
+        j.thread_id,
+        j.project_id,
+        (SELECT prompt FROM jobs first WHERE first.thread_id = j.thread_id ORDER BY first.created_at, first.rowid LIMIT 1) AS title,
+        (SELECT status FROM jobs latest WHERE latest.thread_id = j.thread_id ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1) AS latest_status,
+        (SELECT agent FROM jobs latest2 WHERE latest2.thread_id = j.thread_id ORDER BY latest2.created_at DESC, latest2.rowid DESC LIMIT 1) AS latest_agent,
+        (SELECT model FROM jobs latest3 WHERE latest3.thread_id = j.thread_id ORDER BY latest3.created_at DESC, latest3.rowid DESC LIMIT 1) AS latest_model,
+        COUNT(*) AS run_count,
+        MAX(j.updated_at) AS updated_at,
+        MIN(j.created_at) AS created_at,
+        CASE WHEN MAX(j.archived_at) IS NOT NULL THEN 1 ELSE 0 END AS archived
+      FROM jobs j
+      ${whereClause}
+      GROUP BY j.thread_id, j.project_id
+    `;
+
+    const havingConditions: string[] = [];
+    const havingParams: (string | number | null)[] = [];
+
+    if (filters.query) {
+      const pattern = `%${filters.query}%`;
+      havingConditions.push(`(title LIKE ? OR EXISTS (
+        SELECT 1 FROM jobs sq WHERE sq.thread_id = j.thread_id AND (sq.prompt LIKE ? OR EXISTS (
+          SELECT 1 FROM job_events se WHERE se.job_id = sq.id AND se.type = 'final_response' AND se.message LIKE ?
+        ))
+      ))`);
+      havingParams.push(pattern, pattern, pattern);
+    }
+    if (filters.status) {
+      havingConditions.push('latest_status = ?');
+      havingParams.push(filters.status);
+    }
+    if (filters.repositoryId) {
+      havingConditions.push(`EXISTS (
+        SELECT 1 FROM job_repositories jr JOIN jobs jj ON jj.id = jr.job_id
+        WHERE jj.thread_id = j.thread_id AND jr.repository_id = ?
+      )`);
+      havingParams.push(filters.repositoryId);
+    }
+
+    const havingClause = havingConditions.length ? `HAVING ${havingConditions.join(' AND ')}` : '';
+
+    const countQuery = `SELECT COUNT(*) AS total FROM (${baseQuery} ${havingClause})`;
+    const countRow = this.db.prepare(countQuery).get(...params, ...havingParams) as { total: number };
+    const total = Number(countRow.total);
+
+    const offset = (page - 1) * pageSize;
+    const dataQuery = `${baseQuery} ${havingClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`;
+    const rows = this.db.prepare(dataQuery).all(...params, ...havingParams, pageSize, offset) as unknown as Array<{
+      thread_id: string; project_id: string; title: string; latest_status: JobStatus;
+      latest_agent: string; latest_model: string; run_count: number; updated_at: string; created_at: string; archived: number;
+    }>;
+
+    const results: ThreadSearchResult[] = rows.map((row) => {
+      const repoRows = this.db.prepare(
+        'SELECT DISTINCT jr.repository_id FROM job_repositories jr JOIN jobs jj ON jj.id = jr.job_id WHERE jj.thread_id = ?'
+      ).all(row.thread_id) as Array<{ repository_id: string }>;
+      return {
+        threadId: row.thread_id,
+        projectId: row.project_id,
+        title: row.title,
+        latestStatus: row.latest_status,
+        agent: row.latest_agent as ThreadSearchResult['agent'],
+        model: row.latest_model || '',
+        runCount: Number(row.run_count),
+        repositoryIds: repoRows.map((r) => r.repository_id),
+        updatedAt: row.updated_at,
+        createdAt: row.created_at,
+        archived: Boolean(row.archived),
+      };
+    });
+
+    return { results, total };
   }
 
   close() { this.db.close(); }

@@ -6,7 +6,7 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
+import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, threadSearchSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
 import { buildCapabilities, validateSelection } from './capabilities.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
@@ -234,6 +234,13 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.get('/jobs', async (request) => {
     const query = request.query as { projectId?: string };
     return store.listJobs(query.projectId);
+  });
+  app.get('/threads/search', async (request) => {
+    const filters = threadSearchSchema.parse(request.query);
+    const { results, total } = store.searchThreads(filters);
+    const page = Math.max(1, filters.page ?? 1);
+    const pageSize = Math.min(100, Math.max(1, filters.pageSize ?? 20));
+    return { results, total, page, pageSize, totalPages: Math.ceil(total / pageSize) };
   });
   app.get('/threads/archived', async () => store.archivedThreads(new Date(now()).toISOString()));
   app.post('/threads/:id/archive', async (request, reply) => {

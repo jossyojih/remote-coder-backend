@@ -64,6 +64,19 @@ export const followUpSchema = z.object({
   if (value.scopeMode !== 'manual' && ids.length > 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository selections require manual scope' });
 });
 
+export const threadSearchSchema = z.object({
+  query: z.string().max(500).optional(),
+  projectId: z.string().uuid().optional(),
+  status: z.enum(['queued', 'running', 'needs_input', 'failed', 'done', 'cancelled']).optional(),
+  agent: z.enum(['mock', 'codex', 'claude']).optional(),
+  repositoryId: z.string().uuid().optional(),
+  dateFrom: z.string().datetime().optional(),
+  dateTo: z.string().datetime().optional(),
+  includeArchived: z.coerce.boolean().optional(),
+  page: z.coerce.number().int().min(1).optional(),
+  pageSize: z.coerce.number().int().min(1).max(100).optional(),
+});
+
 export const promoteJobSchema = z.object({
   commitMessage: z.string().trim().min(1).max(500).refine((value) => !value.includes('\0'), 'Commit message contains an invalid character'),
   approvedRepositoryIds: z.array(z.string().uuid()).min(1).max(100),

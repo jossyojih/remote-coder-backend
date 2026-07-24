@@ -114,3 +114,38 @@ export interface Deployment {
 export interface DeploymentClaim extends Deployment {
   sourcePath: string; remoteName: string; targetBranch: string;
 }
+
+export interface ThreadSearchFilters {
+  query?: string;
+  projectId?: string;
+  status?: JobStatus;
+  agent?: Agent;
+  repositoryId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  includeArchived?: boolean;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface ThreadSearchResult {
+  threadId: string;
+  projectId: string;
+  title: string;
+  latestStatus: JobStatus;
+  agent: Agent;
+  model: string;
+  runCount: number;
+  repositoryIds: string[];
+  updatedAt: string;
+  createdAt: string;
+  archived: boolean;
+}
+
+export interface ThreadSearchResponse {
+  results: ThreadSearchResult[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+}
