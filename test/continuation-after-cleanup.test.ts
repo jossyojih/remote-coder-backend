@@ -80,8 +80,7 @@ describe('Continuation after maintenance cleanup', () => {
         prompt: 'Make a test change',
         selectedRepositoryIds: [repositoryId],
         agent: 'mock',
-        model: 'test',
-        reasoningLevel: 'low',
+        model: 'mock',
       },
     });
     assert.equal(jobResponse.statusCode, 201);
@@ -131,6 +130,7 @@ describe('Continuation after maintenance cleanup', () => {
       payload: {
         message: 'Continue with another change',
         requestId: crypto.randomUUID(),
+        scopeMode: 'manual',
         requestedRepositoryIds: [repositoryId],
       },
     });
@@ -141,7 +141,8 @@ describe('Continuation after maintenance cleanup', () => {
   });
 
   it('should preserve thread history and permissions after cleanup', async () => {
-    const repoPath = await setupRepository('test-repo-2');
+    const repoPathA = await setupRepository('test-repo-2a');
+    const repoPathB = await setupRepository('test-repo-2b');
 
     const projectResponse = await app.app.inject({
       method: 'POST',
@@ -150,8 +151,8 @@ describe('Continuation after maintenance cleanup', () => {
       payload: {
         name: 'Test Project 2',
         repositories: [
-          { name: 'repo-a', path: repoPath },
-          { name: 'repo-b', path: repoPath },
+          { name: 'repo-a', path: repoPathA },
+          { name: 'repo-b', path: repoPathB },
         ],
       },
     });
@@ -168,8 +169,7 @@ describe('Continuation after maintenance cleanup', () => {
         prompt: 'First change',
         selectedRepositoryIds: [repoAId],
         agent: 'mock',
-        model: 'test',
-        reasoningLevel: 'low',
+        model: 'mock',
       },
     });
     assert.equal(jobResponse.statusCode, 201);
@@ -204,6 +204,7 @@ describe('Continuation after maintenance cleanup', () => {
       payload: {
         message: 'Second change',
         requestId: crypto.randomUUID(),
+        scopeMode: 'manual',
         requestedRepositoryIds: [repoAId],
       },
     });

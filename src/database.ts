@@ -427,6 +427,12 @@ export class Store {
       .all(job.threadId, job.projectId, decision) as Array<{ repository_id: string }>).map((row) => row.repository_id);
   }
 
+  threadPermissions(id: string): Array<{ repositoryId: string; decision: 'approved' | 'rejected' }> {
+    const job = this.getJob(id); if (!job) return [];
+    return (this.db.prepare('SELECT repository_id, decision FROM thread_repository_permissions WHERE thread_id=? AND project_id=? ORDER BY rowid')
+      .all(job.threadId, job.projectId) as Array<{ repository_id: string; decision: 'approved' | 'rejected' }>).map((row) => ({ repositoryId: row.repository_id, decision: row.decision }));
+  }
+
   private setThreadPermissions(job: Job, repositoryIds: string[], decision: 'approved' | 'rejected'): void {
     const statement = this.db.prepare(`INSERT INTO thread_repository_permissions(thread_id,project_id,repository_id,decision,decided_by_job_id,updated_at)
       VALUES (?,?,?,?,?,?) ON CONFLICT(thread_id,repository_id) DO UPDATE SET

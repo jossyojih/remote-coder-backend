@@ -52,8 +52,7 @@ describe('Repository validation before promotion', () => {
         prompt: 'Make a change',
         selectedRepositoryIds: [repositoryId],
         agent: 'mock',
-        model: 'test',
-        reasoningLevel: 'low',
+        model: 'mock',
       },
     });
     const job = JSON.parse(jobResponse.body);
@@ -115,7 +114,7 @@ describe('Repository validation before promotion', () => {
         approvedRepositoryIds: [repositoryId],
       },
     });
-    assert.equal(promoteResponse.statusCode, 200);
+    assert.equal(promoteResponse.statusCode, 409);
     const promotion = JSON.parse(promoteResponse.body);
     assert.equal(promotion.status, 'failed');
     const failedRepo = promotion.repositories.find((r: any) => r.repositoryId === repositoryId);

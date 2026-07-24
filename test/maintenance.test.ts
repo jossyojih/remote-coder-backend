@@ -69,6 +69,7 @@ describe('MaintenanceService', () => {
         cleanupEnabled: overrides.cleanupEnabled ?? true,
       },
       { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as any,
+      undefined,
       () => nowValue,
       undefined,
       overrides.listWorktrees,
