@@ -159,6 +159,21 @@ export class Store {
       CREATE INDEX IF NOT EXISTS attachments_job ON attachments(job_id);
       CREATE INDEX IF NOT EXISTS attachments_thread ON attachments(thread_id);
     `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS repository_validation_config (
+        repository_id TEXT PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        commands TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS promotion_validation_results (
+        promotion_id TEXT NOT NULL REFERENCES promotions(id) ON DELETE CASCADE,
+        repository_id TEXT NOT NULL REFERENCES repositories(id),
+        passed INTEGER NOT NULL,
+        results TEXT NOT NULL,
+        validated_at TEXT NOT NULL,
+        PRIMARY KEY(promotion_id, repository_id)
+      );
+    `);
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
   }
@@ -747,5 +762,30 @@ export class Store {
     type AttachmentRow = { id: string; project_id: string };
     const rows = this.db.prepare('SELECT DISTINCT id,project_id FROM attachments WHERE thread_id=?').all(threadId) as unknown as AttachmentRow[];
     return rows.map((row) => ({ id: row.id, projectId: row.project_id }));
+  }
+
+  getValidationConfig(repositoryId: string): { enabled: boolean; commands: Array<{ command: string; args: string[]; description: string }> } {
+    type ConfigRow = { enabled: number; commands: string };
+    const row = this.db.prepare('SELECT enabled,commands FROM repository_validation_config WHERE repository_id=?').get(repositoryId) as unknown as ConfigRow | undefined;
+    if (!row) return { enabled: false, commands: [] };
+    return { enabled: Boolean(row.enabled), commands: JSON.parse(row.commands) };
+  }
+
+  setValidationConfig(repositoryId: string, enabled: boolean, commands: Array<{ command: string; args: string[]; description: string }>): void {
+    this.db.prepare('INSERT OR REPLACE INTO repository_validation_config(repository_id,enabled,commands) VALUES(?,?,?)').run(repositoryId, enabled ? 1 : 0, JSON.stringify(commands));
+  }
+
+  saveValidationResults(promotionId: string, results: Array<{ repositoryId: string; passed: boolean; results: unknown }>): void {
+    const now = new Date().toISOString();
+    const insert = this.db.prepare('INSERT OR REPLACE INTO promotion_validation_results(promotion_id,repository_id,passed,results,validated_at) VALUES(?,?,?,?,?)');
+    for (const result of results) {
+      insert.run(promotionId, result.repositoryId, result.passed ? 1 : 0, JSON.stringify(result.results), now);
+    }
+  }
+
+  getValidationResults(promotionId: string): Array<{ repositoryId: string; passed: boolean; results: unknown; validatedAt: string }> {
+    type ResultRow = { repository_id: string; passed: number; results: string; validated_at: string };
+    const rows = this.db.prepare('SELECT repository_id,passed,results,validated_at FROM promotion_validation_results WHERE promotion_id=? ORDER BY validated_at').all(promotionId) as unknown as ResultRow[];
+    return rows.map((row) => ({ repositoryId: row.repository_id, passed: Boolean(row.passed), results: JSON.parse(row.results), validatedAt: row.validated_at }));
   }
 }

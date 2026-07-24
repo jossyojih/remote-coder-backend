@@ -4,6 +4,7 @@ import type { Store } from './database.js';
 import { runCommand } from './agent-runtime.js';
 import type { JobRepositoryRun, Promotion } from './types.js';
 import type { DeploymentCoordinator } from './deployment.js';
+import { validateRepositories, type ValidationResult } from './validation.js';
 
 const MAX_DIFF_BYTES = 120_000;
 const MAX_FILE_DIFF_BYTES = 32_000;
@@ -65,7 +66,17 @@ export class PromotionService {
     const job = this.store.getJob(jobId); if (!job) throw new PromotionConflictError('Job not found', 'not_found');
     if (job.status !== 'done') throw new PromotionConflictError('Only successfully completed jobs can be reviewed', 'job_not_done');
     const project = this.store.getProject(job.projectId); const runs = this.store.repositoryRuns(jobId);
-    if (!project || runs.length === 0) throw new PromotionConflictError('The job has no retained worktrees', 'worktree_not_retained');
+    if (!project) throw new PromotionConflictError('Project not found', 'not_found');
+    if (runs.length === 0) {
+      return {
+        jobId,
+        promotion: this.store.getPromotion(jobId),
+        repositories: [],
+        hasChanges: false,
+        workspaceCleared: true,
+        limits: { totalDiffBytes: MAX_DIFF_BYTES, perFileDiffBytes: MAX_FILE_DIFF_BYTES },
+      };
+    }
     const repositories = [];
     for (const run of runs) {
       if (!job.resolvedRepositoryIds.includes(run.repositoryId) || !project.repositories.some((r) => r.id === run.repositoryId)) throw new PromotionConflictError('Repository is no longer owned by this job project', 'ownership_changed');
@@ -105,6 +116,29 @@ export class PromotionService {
     const existing = started.promotion!;
     const existingIds = existing.repositories.map((r) => r.repositoryId);
     if (approvedIds.some((id) => !existingIds.includes(id))) throw new PromotionConflictError('Approved repositories could not be added to the promotion', 'approval_mismatch');
+
+    const validationConfigs = new Map(repositories.map((r) => [r.id, this.store.getValidationConfig(r.id)]));
+    const validationResults = await validateRepositories(repositories, runs, validationConfigs);
+    this.store.saveValidationResults(existing.id, validationResults);
+
+    const failedValidation = validationResults.filter((r) => !r.passed);
+    if (failedValidation.length > 0) {
+      for (const result of failedValidation) {
+        const failedCommand = result.results.find((cmd) => !cmd.passed);
+        this.store.setPromotionRepository(jobId, result.repositoryId, 'failed', {
+          error: failedCommand ? `Validation failed: ${failedCommand.description} (exit code ${failedCommand.exitCode})` : 'Validation failed',
+        });
+        this.store.addEvent(jobId, 'promotion_result', 'Repository promotion blocked by failing validation', {
+          repositoryId: result.repositoryId,
+          effectivePolicy: allowedPolicy,
+          result: 'failed',
+          validationFailed: true,
+          failedCommand: failedCommand?.command,
+        });
+      }
+      return this.store.getPromotion(jobId)!;
+    }
+
     for (const run of runs) {
       const prior = existing.repositories.find((r) => r.repositoryId === run.repositoryId)!;
       if (prior.status !== 'promoted') await this.deployments?.assertAvailable(run);
