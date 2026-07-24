@@ -272,6 +272,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.post('/jobs', async (request, reply) => {
     const input = createJobSchema.parse(request.body);
     const project = store.getProject(input.projectId); if (!project) return reply.code(404).send({ error: 'Project not found' });
+    if (project.repositories.length === 0) return reply.code(409).send({ error: 'Project has no repositories. Add at least one repository before creating a job.', code: 'project_has_no_repositories' });
     const requested = input.requestedRepositoryIds ?? input.selectedRepositoryIds ?? [];
     if (requested.length && !store.repositoriesBelongTo(input.projectId, requested)) return reply.code(400).send({ error: 'Every requested repository must belong to the project' });
     const projectDefaults = project.defaultAgent ? { agent: project.defaultAgent, model: project.defaultModel, reasoningLevel: project.defaultReasoningLevel } : undefined;

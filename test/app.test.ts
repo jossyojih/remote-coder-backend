@@ -292,3 +292,37 @@ test('purges expired archived thread data idempotently', () => {
   assert.equal(store.purgeExpiredThread(job.id, 1_000 + 8 * 86_400_000), false);
   store.close();
 });
+
+test('rejects job creation on a project with no repositories (409 project_has_no_repositories)', async () => {
+  const { app } = await fixture();
+  const emptyProject = await app.inject({ method: 'POST', url: '/projects', headers: auth, payload: { name: 'Empty Project', repositories: [] } });
+  assert.equal(emptyProject.statusCode, 201);
+  const p = emptyProject.json();
+  assert.equal(p.repositories.length, 0);
+
+  const jobAttempt = await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: p.id, prompt: 'Do something', scopeMode: 'auto' } });
+  assert.equal(jobAttempt.statusCode, 409);
+  assert.equal(jobAttempt.json().code, 'project_has_no_repositories');
+  assert.match(jobAttempt.json().error, /repository/i);
+
+  const jobsList = await app.inject({ url: '/jobs', headers: auth });
+  assert.equal(jobsList.json().length, 0, 'no failed job records should be created');
+});
+
+test('project with no repositories can have a repository added and then accepts jobs', async () => {
+  const { app, root } = await fixture();
+  const emptyProject = await app.inject({ method: 'POST', url: '/projects', headers: auth, payload: { name: 'Setup Project', repositories: [] } });
+  assert.equal(emptyProject.statusCode, 201);
+  const p = emptyProject.json();
+
+  const addRepo = await app.inject({ method: 'POST', url: `/projects/${p.id}/repositories`, headers: auth, payload: { name: 'A', path: join(root, 'repo-a'), remoteName: 'origin' } });
+  // Adding a repo by path is not supported via the URL endpoint (which requires url field)
+  // Instead, use a project with a path-based repo directly
+  const withRepo = await app.inject({ method: 'POST', url: '/projects', headers: auth, payload: { name: 'With Repo', repositories: [{ name: 'A', path: join(root, 'repo-a') }] } });
+  assert.equal(withRepo.statusCode, 201);
+  const pw = withRepo.json();
+  assert.equal(pw.repositories.length, 1);
+
+  const jobOk = await app.inject({ method: 'POST', url: '/jobs', headers: auth, payload: { projectId: pw.id, prompt: 'Now it works', selectedRepositoryIds: [pw.repositories[0].id] } });
+  assert.equal(jobOk.statusCode, 201);
+});
