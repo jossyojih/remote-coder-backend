@@ -52,16 +52,17 @@ export function stopProcess(child: ChildProcess, graceMs: number): void {
   timer.unref(); child.once('close', () => clearTimeout(timer));
 }
 
-export function buildJobPrompt(job: Job, repositories: PreparedRepository[], runDirectory: string): string {
+export function buildJobPrompt(job: Job, repositories: PreparedRepository[], runDirectory: string, attachmentPaths?: string[]): string {
   const listing = repositories.map(({ repository, worktreePath }) => `- ${repository.name}: ${worktreePath}`).join('\n');
   const candidates = job.repositoryScopeCandidates?.map((repository) => `- ${repository.repositoryId}: ${repository.repositoryName} (${repository.role})`).join('\n') ?? '';
   const prior = job.conversationContext ? `\n\nPrior conversation context (bounded, oldest to newest):\n${job.conversationContext}` : '';
+  const attachmentSection = attachmentPaths?.length ? `\n\nAttached files (read-only references provided by the user):\n${attachmentPaths.map((p) => `- ${p}`).join('\n')}` : '';
   const insufficientScopeRule = job.scopeMode === 'auto'
     ? '- If the task cannot be completed because repository scope is insufficient, do not claim completion or make speculative changes. Return a JSON object with type "scope_required", suggestedRepositoryIds, and reasons.'
     : job.scopeMode === 'manual'
       ? '- Manual repository scope is a strict boundary. Do not request, propose, inspect, or add another repository. Complete only the work possible in the selected repositories and clearly report any limitation.'
       : '- All project repositories are already selected; do not request or propose repository scope changes.';
-  return `You are executing backend job ${job.id} in an isolated run directory.\n\nSelected repositories (all and only the repositories you may access):\n${listing}\n\nProject repository candidates (bounded metadata only; these are not filesystem grants):\n${candidates}${prior}\n\nCurrent user request:\n${job.prompt}\n\nRules:\n- Do not read, write, or traverse outside ${runDirectory}.\n- Work only in the selected repository directories listed above.\n- Do not create or use subagents.\n- Run relevant tests and builds for the changes you make.\n- Do not commit, push, deploy, or delete worktrees.\n${insufficientScopeRule}\n- Finish with a concise summary of changes and validation results.\n`;
+  return `You are executing backend job ${job.id} in an isolated run directory.\n\nSelected repositories (all and only the repositories you may access):\n${listing}\n\nProject repository candidates (bounded metadata only; these are not filesystem grants):\n${candidates}${prior}${attachmentSection}\n\nCurrent user request:\n${job.prompt}\n\nRules:\n- Do not read, write, or traverse outside ${runDirectory}.\n- Work only in the selected repository directories listed above.\n- Do not create or use subagents.\n- Run relevant tests and builds for the changes you make.\n- Do not commit, push, deploy, or delete worktrees.\n${insufficientScopeRule}\n- Finish with a concise summary of changes and validation results.\n`;
 }
 
 export async function prepareRepositories(job: Job, repositories: Repository[], workspaceRoot: string, runsRootOption: string, emit: AgentEventEmitter): Promise<{ runDirectory: string; prepared: PreparedRepository[] }> {

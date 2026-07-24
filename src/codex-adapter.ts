@@ -60,7 +60,7 @@ export class CodexAgentAdapter implements AgentAdapter {
   async run(job: Job, repositories: Repository[], emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
     const { runDirectory, prepared } = await prepareRepositories(job, repositories, this.options.workspaceRoot, this.options.runsRoot, emit);
 
-    const prompt = buildJobPrompt(job, prepared, runDirectory);
+    const prompt = buildJobPrompt(job, prepared, runDirectory, job.attachmentPaths);
     await this.executeCodex(job.id, job.model, job.reasoningLevel!, prompt, runDirectory, emit, signal);
     for (const repository of prepared) {
       try { emit('repository_result', `Collected changes for ${repository.repository.name}`, { ...(await collectChanges(repository)), scopeReason: job.scopeReasons.find((reason) => reason.repositoryId === repository.repository.id)?.reason }); }

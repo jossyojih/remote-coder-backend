@@ -138,7 +138,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
       log: app.log,
     }),
-  }, app.log, 25, undefined, (jobId) => promotion.applyEffectivePolicies(jobId));
+  }, app.log, 25, undefined, (jobId) => promotion.applyEffectivePolicies(jobId), attachments);
 
   app.addHook('onRequest', async (request, reply) => {
     const origin = request.headers.origin;
@@ -226,6 +226,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const job = store.createJob(input.projectId, input.prompt, requested, selection, legacySelection ? 'manual' : input.scopeMode);
     if (input.attachments) {
       for (const attachment of input.attachments) {
+        attachments.promote(attachment.id, input.projectId, job.threadId!);
         store.addAttachment(attachment.id, job.id, job.threadId!, input.projectId, attachment.filename, attachment.mimeType, attachment.sizeBytes);
       }
     }
@@ -323,6 +324,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     if (result.conflict === 'archived') return reply.code(409).send({ error: 'Archived threads cannot be continued' });
     if (result.job && input.attachments) {
       for (const attachment of input.attachments) {
+        attachments.promote(attachment.id, result.job.projectId, result.job.threadId!);
         store.addAttachment(attachment.id, result.job.id, result.job.threadId!, result.job.projectId, attachment.filename, attachment.mimeType, attachment.sizeBytes);
       }
     }
@@ -379,11 +381,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       if (!attachments.validateMimeType(part.mimetype)) return reply.code(400).send({ error: `File type ${part.mimetype} not allowed` });
       if (!attachments.validateExtension(part.filename)) return reply.code(400).send({ error: `File extension not allowed` });
       const id = crypto.randomUUID();
-      const tempProjectId = crypto.randomUUID();
-      const tempThreadId = crypto.randomUUID();
-      const tempJobId = crypto.randomUUID();
-      const stored = attachments.store(id, tempProjectId, tempThreadId, tempJobId, part.filename, part.mimetype, buffer);
-      uploaded.push({ id: stored.id, filename: stored.filename, mimeType: stored.mimeType, sizeBytes: stored.sizeBytes });
+      const staged = attachments.stage(id, part.filename, part.mimetype, buffer);
+      uploaded.push(staged);
     }
     return { attachments: uploaded };
   });

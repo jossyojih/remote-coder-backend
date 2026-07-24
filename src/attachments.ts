@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -37,9 +37,13 @@ export interface StoredAttachment extends AttachmentMetadata {
 }
 
 export class AttachmentStorage {
+  private readonly stagingDir: string;
+
   constructor(private readonly root: string) {
     if (!isAbsolute(root)) throw new Error('ATTACHMENTS_ROOT must be an absolute path');
     mkdirSync(root, { recursive: true });
+    this.stagingDir = join(root, '.staging');
+    mkdirSync(this.stagingDir, { recursive: true });
   }
 
   validateMimeType(mimeType: string): boolean {
@@ -69,6 +73,43 @@ export class AttachmentStorage {
     const rel = relative(this.root, candidate);
     if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('Path traversal detected');
     return candidate;
+  }
+
+  stage(id: string, filename: string, mimeType: string, content: Buffer): { id: string; filename: string; mimeType: string; sizeBytes: number } {
+    const safeFilename = this.validateFilename(filename);
+    if (!this.validateExtension(safeFilename)) throw new Error('File type not allowed');
+    if (!this.validateMimeType(mimeType)) throw new Error('MIME type not allowed');
+    if (content.length > ATTACHMENT_LIMITS.maxFileSize) throw new Error(`File exceeds ${ATTACHMENT_LIMITS.maxFileSize / (1024 * 1024)}MB limit`);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Invalid attachment ID');
+    const stagingPath = join(this.stagingDir, id);
+    writeFileSync(stagingPath, content);
+    const parts = mimeType.toLowerCase().split(';');
+    const normalizedMimeType = (parts[0] ?? 'application/octet-stream').trim();
+    writeFileSync(`${stagingPath}.meta.json`, JSON.stringify({ id, filename: safeFilename, mimeType: normalizedMimeType, sizeBytes: content.length }));
+    return { id, filename: safeFilename, mimeType: normalizedMimeType, sizeBytes: content.length };
+  }
+
+  promote(id: string, projectId: string, threadId: string): boolean {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return false;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(projectId)) return false;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)) return false;
+    const stagingPath = join(this.stagingDir, id);
+    if (!existsSync(stagingPath)) return false;
+    const destPath = this.safePath(id, projectId, threadId);
+    mkdirSync(dirname(destPath), { recursive: true });
+    renameSync(stagingPath, destPath);
+    const metaSrc = `${stagingPath}.meta.json`;
+    if (existsSync(metaSrc)) {
+      try {
+        const staged = JSON.parse(readFileSync(metaSrc, 'utf8'));
+        const full: AttachmentMetadata = { id, jobId: '', threadId, projectId, filename: staged.filename, mimeType: staged.mimeType, sizeBytes: staged.sizeBytes, createdAt: new Date().toISOString() };
+        writeFileSync(`${destPath}.meta.json`, JSON.stringify(full, null, 2), 'utf8');
+        rmSync(metaSrc, { force: true });
+      } catch {
+        renameSync(metaSrc, `${destPath}.meta.json`);
+      }
+    }
+    return true;
   }
 
   store(id: string, projectId: string, threadId: string, jobId: string, filename: string, mimeType: string, content: Buffer): StoredAttachment {
@@ -132,6 +173,16 @@ export class AttachmentStorage {
       if (!existsSync(storagePath)) return 0;
       return statSync(storagePath).size;
     } catch { return 0; }
+  }
+
+  pathsForJob(attachments: Array<{ id: string; projectId: string; threadId: string }>): string[] {
+    return attachments.flatMap(({ id, projectId, threadId }) => {
+      try {
+        const storagePath = this.safePath(id, projectId, threadId);
+        if (!existsSync(storagePath)) return [];
+        return [storagePath];
+      } catch { return []; }
+    });
   }
 
   generateHash(content: Buffer): string {

@@ -67,6 +67,7 @@ export interface Job {
   error?: string;
   question?: string;
   repositoryScopeCandidates?: Array<{ repositoryId: string; repositoryName: string; role: string }>;
+  attachmentPaths?: string[];
   threadRepositoryPermissions: ThreadRepositoryPermission[];
 }
 

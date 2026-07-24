@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import { Store } from './database.js';
 import type { AgentAdapter, Job, JobEvent, Repository } from './types.js';
 import { RepositoryScopePlanner } from './scope-planner.js';
+import type { AttachmentStorage } from './attachments.js';
 
 export class JobEventBus extends EventEmitter {
   publish(event: JobEvent) { this.emit(event.jobId, event); }
@@ -33,7 +34,7 @@ export class JobWorker {
   private active?: { jobId: string; controller: AbortController };
   private stopping = false;
 
-  constructor(private store: Store, private bus: JobEventBus, private adapters: Partial<Record<'mock' | 'codex' | 'claude', AgentAdapter>>, private log: FastifyBaseLogger, private pollMs = 25, private planner = new RepositoryScopePlanner(), private readonly onTerminal?: (jobId: string) => Promise<void>) {}
+  constructor(private store: Store, private bus: JobEventBus, private adapters: Partial<Record<'mock' | 'codex' | 'claude', AgentAdapter>>, private log: FastifyBaseLogger, private pollMs = 25, private planner = new RepositoryScopePlanner(), private readonly onTerminal?: (jobId: string) => Promise<void>, private readonly attachmentStorage?: AttachmentStorage) {}
 
   start() { this.timer = setInterval(() => void this.tick(), this.pollMs); this.timer.unref(); void this.tick(); }
   wake() { void this.tick(); }
@@ -139,6 +140,16 @@ export class JobWorker {
       current = { ...current, repositoryScopeCandidates: candidates.map((repository) => ({ repositoryId: repository.id, repositoryName: repository.name, role: this.planner.describe(repository) })) };
       const repositories = this.store.repositories(current.resolvedRepositoryIds);
       if (repositories.length !== current.resolvedRepositoryIds.length || repositories.length === 0) throw new Error('Resolved repository scope is empty or invalid');
+      if (this.attachmentStorage) {
+        const dbAttachments = this.store.getAttachments(job.id);
+        if (dbAttachments.length) {
+          const meta = dbAttachments.map((a) => {
+            const full = this.store.getAttachmentMeta(a.id);
+            return full ? { id: a.id, projectId: full.projectId, threadId: full.threadId } : undefined;
+          }).filter((m): m is { id: string; projectId: string; threadId: string } => m !== undefined);
+          current = { ...current, attachmentPaths: this.attachmentStorage.pathsForJob(meta) };
+        }
+      }
       const adapter = this.adapters[current.agent]; if (!adapter) throw new Error(`Agent ${current.agent} is not available`);
       await adapter.run(current, repositories, (type, message, data) => {
         if (type === 'scope_required' && current.scopeMode !== 'auto') return;
