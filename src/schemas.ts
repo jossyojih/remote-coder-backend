@@ -18,6 +18,13 @@ export const createProjectSchema = z.object({
   })).min(1),
 });
 
+export const attachmentMetadataSchema = z.object({
+  id: z.string().uuid(),
+  filename: z.string().min(1).max(255),
+  mimeType: z.string().min(1).max(200),
+  sizeBytes: z.number().int().min(0).max(10 * 1024 * 1024),
+});
+
 export const createJobSchema = z.object({
   projectId: z.string().uuid(),
   prompt: z.string().trim().min(1).max(100_000),
@@ -27,6 +34,7 @@ export const createJobSchema = z.object({
   agent: z.enum(['mock', 'codex', 'claude']).optional(),
   model: z.string().max(128).optional(),
   reasoningLevel: z.enum(['low', 'medium', 'high']).optional(),
+  attachments: z.array(attachmentMetadataSchema).max(10).optional(),
 }).superRefine((value, context) => {
   const ids = value.requestedRepositoryIds ?? value.selectedRepositoryIds ?? [];
   if (new Set(ids).size !== ids.length) {
@@ -34,6 +42,9 @@ export const createJobSchema = z.object({
   }
   if (value.scopeMode === 'manual' && ids.length === 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Manual scope requires at least one repository' });
   if (value.scopeMode === 'all' && ids.length > 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'All scope does not accept repository selections' });
+  const attachments = value.attachments ?? [];
+  const totalSize = attachments.reduce((sum, a) => sum + a.sizeBytes, 0);
+  if (totalSize > 50 * 1024 * 1024) context.addIssue({ code: 'custom', path: ['attachments'], message: 'Total attachment size exceeds 50MB' });
 });
 
 export const replySchema = z.object({
@@ -57,11 +68,15 @@ export const followUpSchema = z.object({
   requestedRepositoryIds: z.array(z.string().uuid()).optional(),
   model: z.string().max(128).optional(),
   reasoningLevel: z.enum(['low', 'medium', 'high']).optional(),
+  attachments: z.array(attachmentMetadataSchema).max(10).optional(),
 }).superRefine((value, context) => {
   const ids = value.requestedRepositoryIds ?? [];
   if (new Set(ids).size !== ids.length) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository IDs must be unique' });
   if (value.scopeMode === 'manual' && ids.length === 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Manual scope requires at least one repository' });
   if (value.scopeMode !== 'manual' && ids.length > 0) context.addIssue({ code: 'custom', path: ['requestedRepositoryIds'], message: 'Repository selections require manual scope' });
+  const attachments = value.attachments ?? [];
+  const totalSize = attachments.reduce((sum, a) => sum + a.sizeBytes, 0);
+  if (totalSize > 50 * 1024 * 1024) context.addIssue({ code: 'custom', path: ['attachments'], message: 'Total attachment size exceeds 50MB' });
 });
 
 export const threadSearchSchema = z.object({

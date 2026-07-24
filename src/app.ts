@@ -2,6 +2,7 @@ import { realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { Writable } from 'node:stream';
 import Fastify, { type FastifyInstance } from 'fastify';
+import multipart from '@fastify/multipart';
 import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
@@ -14,6 +15,7 @@ import { PromotionConflictError, PromotionService } from './promotion.js';
 import { DeploymentCoordinator, systemdDeploymentStarter, type DeploymentStarter } from './deployment.js';
 import { DEPLOYMENT_STATUSES } from './types.js';
 import { MaintenanceService } from './maintenance.js';
+import { AttachmentStorage, ATTACHMENT_LIMITS } from './attachments.js';
 
 export interface AppOptions {
   databasePath?: string;
@@ -55,6 +57,7 @@ export interface AppOptions {
   diskWarningThreshold?: number;
   cleanupBatchLimit?: number;
   maintenanceCleanupEnabled?: boolean;
+  attachmentsRoot?: string;
 }
 
 export interface CommandCenterApp {
@@ -80,6 +83,9 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     ? { level: 'info', stream: options.loggerStream, redact: { paths: ['req.headers.authorization', 'req.body.password', 'req.body.prompt', 'req.body.message', 'res.body.accessToken'], censor: '[REDACTED]' } }
     : (options.logger ? { redact: { paths: ['req.headers.authorization', 'req.body.password', 'req.body.prompt', 'req.body.message', 'res.body.accessToken'], censor: '[REDACTED]' } } : false);
   const app = Fastify({ logger });
+  await app.register(multipart, {
+    limits: { fileSize: ATTACHMENT_LIMITS.maxFileSize, files: ATTACHMENT_LIMITS.maxFilesPerJob },
+  });
   const apiToken = options.apiToken ?? process.env.RUNNER_API_TOKEN;
   const deploymentApiToken = options.deploymentApiToken ?? process.env.DEPLOYMENT_API_TOKEN;
   const appPasswordHash = options.appPasswordHash ?? process.env.APP_PASSWORD_HASH;
@@ -93,6 +99,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const store = new Store(options.databasePath ?? process.env.DATABASE_PATH ?? './data/command-center.sqlite');
   const runsRoot = options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs';
   const absoluteRunsRoot = isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot);
+  const attachmentsRoot = options.attachmentsRoot ?? process.env.ATTACHMENTS_ROOT ?? resolve(process.cwd(), './data/attachments');
+  const attachments = new AttachmentStorage(attachmentsRoot);
   const deploymentCoordinator = new DeploymentCoordinator(store, options.backendDeployRepositoryPath ?? process.env.BACKEND_DEPLOY_REPOSITORY_PATH, options.deploymentStarter ?? systemdDeploymentStarter());
   const promotion = new PromotionService(store, workspaceRoot, absoluteRunsRoot, deploymentCoordinator);
   const bus = new JobEventBus();
@@ -215,7 +223,13 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     if (selection.agent === 'mock' && !allowMockAgent) return reply.code(400).send({ error: 'Mock agents are available only in automated tests' });
     const legacySelection = request.body !== null && typeof request.body === 'object' && !Array.isArray(request.body)
       && !('scopeMode' in request.body) && 'selectedRepositoryIds' in request.body;
-    const job = store.createJob(input.projectId, input.prompt, requested, selection, legacySelection ? 'manual' : input.scopeMode); worker.wake();
+    const job = store.createJob(input.projectId, input.prompt, requested, selection, legacySelection ? 'manual' : input.scopeMode);
+    if (input.attachments) {
+      for (const attachment of input.attachments) {
+        store.addAttachment(attachment.id, job.id, job.threadId!, input.projectId, attachment.filename, attachment.mimeType, attachment.sizeBytes);
+      }
+    }
+    worker.wake();
     return reply.code(201).send(job);
   });
   app.post('/jobs/:id/scope-decision', async (request, reply) => {
@@ -307,6 +321,11 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     if (result.conflict === 'thread_active') return reply.code(409).send({ error: 'This conversation already has an active job' });
     if (result.conflict === 'scope_invalid') return reply.code(409).send({ error: 'The original repository scope is no longer valid' });
     if (result.conflict === 'archived') return reply.code(409).send({ error: 'Archived threads cannot be continued' });
+    if (result.job && input.attachments) {
+      for (const attachment of input.attachments) {
+        store.addAttachment(attachment.id, result.job.id, result.job.threadId!, result.job.projectId, attachment.filename, attachment.mimeType, attachment.sizeBytes);
+      }
+    }
     worker.wake(); return reply.code(201).send(result.job);
   };
   app.post('/jobs/:id/follow-ups', continueJob);
@@ -344,6 +363,43 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const heartbeat = setInterval(() => reply.raw.write(': heartbeat\n\n'), 15_000);
     for (const event of store.events(id, after)) { write(event); if (reply.raw.writableEnded) break; }
     request.raw.on('close', cleanup);
+  });
+
+  app.post('/attachments/upload', async (request, reply) => {
+    const parts = request.parts();
+    const uploaded: Array<{ id: string; filename: string; mimeType: string; sizeBytes: number }> = [];
+    let totalSize = 0;
+    for await (const part of parts) {
+      if (part.type !== 'file') continue;
+      if (uploaded.length >= ATTACHMENT_LIMITS.maxFilesPerJob) return reply.code(400).send({ error: `Maximum ${ATTACHMENT_LIMITS.maxFilesPerJob} files per upload` });
+      const buffer = await part.toBuffer();
+      if (buffer.length > ATTACHMENT_LIMITS.maxFileSize) return reply.code(400).send({ error: `File ${part.filename} exceeds ${ATTACHMENT_LIMITS.maxFileSize / (1024 * 1024)}MB` });
+      totalSize += buffer.length;
+      if (totalSize > ATTACHMENT_LIMITS.maxTotalSize) return reply.code(400).send({ error: `Total size exceeds ${ATTACHMENT_LIMITS.maxTotalSize / (1024 * 1024)}MB` });
+      if (!attachments.validateMimeType(part.mimetype)) return reply.code(400).send({ error: `File type ${part.mimetype} not allowed` });
+      if (!attachments.validateExtension(part.filename)) return reply.code(400).send({ error: `File extension not allowed` });
+      const id = crypto.randomUUID();
+      const tempProjectId = crypto.randomUUID();
+      const tempThreadId = crypto.randomUUID();
+      const tempJobId = crypto.randomUUID();
+      const stored = attachments.store(id, tempProjectId, tempThreadId, tempJobId, part.filename, part.mimetype, buffer);
+      uploaded.push({ id: stored.id, filename: stored.filename, mimeType: stored.mimeType, sizeBytes: stored.sizeBytes });
+    }
+    return { attachments: uploaded };
+  });
+
+  app.get('/attachments/:id', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const meta = store.getAttachmentMeta(id);
+    if (!meta) return reply.code(404).send({ error: 'Attachment not found' });
+    const job = store.getJob(meta.jobId, true);
+    if (!job) return reply.code(404).send({ error: 'Associated job not found' });
+    const retrieved = attachments.retrieve(id, meta.projectId, meta.threadId);
+    if (!retrieved) return reply.code(404).send({ error: 'Attachment file not found' });
+    reply.type(retrieved.meta.mimeType);
+    reply.header('Content-Disposition', `inline; filename="${encodeURIComponent(retrieved.meta.filename)}"`);
+    reply.header('Content-Length', String(retrieved.content.length));
+    return reply.send(retrieved.content);
   });
 
   app.get('/maintenance/status', async () => {
@@ -427,6 +483,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       cleanupEnabled: options.maintenanceCleanupEnabled ?? process.env.MAINTENANCE_CLEANUP_ENABLED === 'true',
     },
     app.log,
+    attachments,
     now,
     options.maintenanceRunOverride,
   );

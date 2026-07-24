@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve, basename } from 'node:path';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Store } from './database.js';
 import { runCommand } from './agent-runtime.js';
+import type { AttachmentStorage } from './attachments.js';
 
 export interface MaintenanceConfig {
   runsRoot: string;
@@ -218,6 +219,7 @@ export class MaintenanceService {
     private readonly store: Store,
     private readonly config: MaintenanceConfig,
     private readonly log: FastifyBaseLogger,
+    private readonly attachments?: AttachmentStorage,
     private readonly now: () => number = Date.now,
     private readonly maintenanceRunOverride?: () => Promise<void>,
     private readonly listWorktrees: (sourcePath: string, timeoutMs: number) => Promise<string> =
@@ -454,6 +456,18 @@ export class MaintenanceService {
         }
       }
       if (safeToPurge) {
+        if (this.attachments) {
+          const threadAttachments = this.store.threadAttachments(expired.threadId);
+          for (const { id, projectId } of threadAttachments) {
+            try {
+              this.attachments.deleteForThread(projectId, expired.threadId);
+              this.log.info({ threadId: expired.threadId, projectId }, 'deleted attachments for purged thread');
+              break;
+            } catch (error) {
+              this.log.error({ threadId: expired.threadId, projectId, err: error }, 'failed to delete attachments for purged thread');
+            }
+          }
+        }
         this.store.purgeExpiredThread(expired.threadId, nowMs);
       }
     }

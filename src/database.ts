@@ -149,6 +149,16 @@ export class Store {
       CREATE INDEX IF NOT EXISTS thread_permissions_project ON thread_repository_permissions(thread_id,project_id);
     `);
     this.db.exec(`CREATE INDEX IF NOT EXISTS jobs_project_thread ON jobs(project_id, thread_id);`);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS attachments (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        thread_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        filename TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS attachments_job ON attachments(job_id);
+      CREATE INDEX IF NOT EXISTS attachments_thread ON attachments(thread_id);
+    `);
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
   }
@@ -516,6 +526,7 @@ export class Store {
         this.db.prepare('DELETE FROM job_repository_runs WHERE job_id=?').run(id);
         this.db.prepare('DELETE FROM job_repositories WHERE job_id=?').run(id);
         this.db.prepare('DELETE FROM job_requested_repositories WHERE job_id=?').run(id);
+        this.db.prepare('DELETE FROM attachments WHERE job_id=?').run(id);
         if (this.db.prepare('SELECT 1 FROM promotions WHERE job_id=?').get(id)) this.db.prepare("UPDATE jobs SET prompt='[purged archived thread]',conversation_context='',follow_up_request_id=NULL,purge_after=NULL WHERE id=?").run(id);
         else this.db.prepare('DELETE FROM jobs WHERE id=?').run(id);
       }
@@ -713,5 +724,28 @@ export class Store {
   activeDeploymentsForJob(jobId: string): Deployment[] {
     const rows = this.db.prepare("SELECT * FROM deployments WHERE job_id=? AND status IN ('queued','deploying') ORDER BY created_at,rowid").all(jobId) as Array<Record<string, string | null>>;
     return rows.map((row) => this.mapDeployment(row));
+  }
+
+  addAttachment(id: string, jobId: string, threadId: string, projectId: string, filename: string, mimeType: string, sizeBytes: number): void {
+    const createdAt = new Date().toISOString();
+    this.db.prepare('INSERT INTO attachments(id,job_id,thread_id,project_id,filename,mime_type,size_bytes,created_at) VALUES(?,?,?,?,?,?,?,?)').run(id, jobId, threadId, projectId, filename, mimeType, sizeBytes, createdAt);
+  }
+
+  getAttachments(jobId: string): Array<{ id: string; filename: string; mimeType: string; sizeBytes: number; createdAt: string }> {
+    type AttachmentRow = { id: string; filename: string; mime_type: string; size_bytes: number; created_at: string };
+    const rows = this.db.prepare('SELECT id,filename,mime_type,size_bytes,created_at FROM attachments WHERE job_id=? ORDER BY created_at').all(jobId) as unknown as AttachmentRow[];
+    return rows.map((row) => ({ id: row.id, filename: row.filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes), createdAt: row.created_at }));
+  }
+
+  getAttachmentMeta(id: string): { jobId: string; threadId: string; projectId: string; filename: string; mimeType: string; sizeBytes: number } | undefined {
+    type AttachmentRow = { job_id: string; thread_id: string; project_id: string; filename: string; mime_type: string; size_bytes: number };
+    const row = this.db.prepare('SELECT job_id,thread_id,project_id,filename,mime_type,size_bytes FROM attachments WHERE id=?').get(id) as unknown as AttachmentRow | undefined;
+    return row ? { jobId: row.job_id, threadId: row.thread_id, projectId: row.project_id, filename: row.filename, mimeType: row.mime_type, sizeBytes: Number(row.size_bytes) } : undefined;
+  }
+
+  threadAttachments(threadId: string): Array<{ id: string; projectId: string }> {
+    type AttachmentRow = { id: string; project_id: string };
+    const rows = this.db.prepare('SELECT DISTINCT id,project_id FROM attachments WHERE thread_id=?').all(threadId) as unknown as AttachmentRow[];
+    return rows.map((row) => ({ id: row.id, projectId: row.project_id }));
   }
 }
