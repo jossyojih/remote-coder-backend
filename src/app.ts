@@ -221,11 +221,15 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.post('/jobs/:id/scope-decision', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const { decision, requestedRepositoryIds } = scopeDecisionSchema.parse(request.body);
     if (!store.getJob(id)) return reply.code(404).send({ error: 'Job not found' });
+    const repeated = store.hasScopeDecision(id);
     const job = store.decideScope(id, decision === 'approve', decision === 'choose' ? requestedRepositoryIds : undefined);
     if (!job) return reply.code(409).send({ error: 'Job is not waiting for a scope decision' });
-    const decisionMessage = decision === 'approve' ? 'Suggested scope approved' : decision === 'choose' ? 'Repository scope corrected manually' : 'Keeping current repository scope';
-    bus.publish(store.addEvent(id, 'scope_decision', decisionMessage, { decision, resolvedRepositoryIds: job.resolvedRepositoryIds }));
-    worker.wake(); return job;
+    if (!repeated) {
+      const decisionMessage = decision === 'approve' ? 'Suggested scope approved' : decision === 'choose' ? 'Repository scope corrected manually' : 'Keeping current repository scope';
+      bus.publish(store.addEvent(id, 'scope_decision', decisionMessage, { decision, resolvedRepositoryIds: job.resolvedRepositoryIds }));
+      worker.wake();
+    }
+    return job;
   });
   app.get('/jobs', async (request) => {
     const query = request.query as { projectId?: string };

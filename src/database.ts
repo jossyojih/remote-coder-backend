@@ -130,6 +130,24 @@ export class Store {
       CREATE UNIQUE INDEX IF NOT EXISTS jobs_follow_up_request ON jobs(parent_job_id, follow_up_request_id) WHERE follow_up_request_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS jobs_archive_purge ON jobs(archived_at, purge_after);
     `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS thread_repository_permissions (
+        thread_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repository_id TEXT NOT NULL REFERENCES repositories(id), decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
+        decided_by_job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, updated_at TEXT NOT NULL,
+        PRIMARY KEY(thread_id, repository_id)
+      );
+      CREATE TABLE IF NOT EXISTS scope_decisions (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+        decision TEXT NOT NULL CHECK(decision IN ('approve','reject','choose')),
+        repository_ids TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      INSERT OR IGNORE INTO thread_repository_permissions(thread_id,project_id,repository_id,decision,decided_by_job_id,updated_at)
+        SELECT j.thread_id,j.project_id,jr.repository_id,'approved',j.id,j.updated_at
+        FROM jobs j JOIN job_repositories jr ON jr.job_id=j.id
+        ORDER BY j.created_at,j.rowid;
+      CREATE INDEX IF NOT EXISTS thread_permissions_project ON thread_repository_permissions(thread_id,project_id);
+    `);
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
   }
@@ -254,6 +272,8 @@ export class Store {
     const requested = this.db.prepare('SELECT repository_id FROM job_requested_repositories WHERE job_id = ? ORDER BY rowid').all(row.id) as unknown as Array<{ repository_id: string }>;
     const reasons = JSON.parse(row.scope_reasons ?? '[]') as ScopeReason[];
     const proposed = JSON.parse(row.proposed_repository_ids ?? '[]') as string[];
+    const permissions = this.db.prepare('SELECT repository_id,decision,decided_by_job_id FROM thread_repository_permissions WHERE thread_id=? AND project_id=? ORDER BY rowid')
+      .all(row.thread_id ?? row.id, row.project_id) as Array<{ repository_id: string; decision: 'approved' | 'rejected'; decided_by_job_id: string }>;
     const job: Job = {
       id: row.id, projectId: row.project_id, prompt: row.prompt, agent: row.agent ?? 'mock', model: row.model || (row.agent === 'claude' ? 'sonnet' : row.agent === 'mock' ? 'mock' : 'gpt-5-codex'), reasoningLevel: row.reasoning_level ?? undefined, status: row.status,
       scopeMode: row.scope_mode ?? 'manual', requestedRepositoryIds: requested.map((x) => x.repository_id), resolvedRepositoryIds: selected.map((x) => x.repository_id), scopeReasons: reasons,
@@ -262,12 +282,38 @@ export class Store {
       threadId: row.thread_id ?? row.id,
       createdAt: row.created_at, updatedAt: row.updated_at, archivedAt: row.archived_at ?? undefined, purgeAfter: row.purge_after ?? undefined, finalResponse, usage,
       repositoryResults: repositoryResults.length ? repositoryResults : undefined, error, question,
+      threadRepositoryPermissions: permissions.map((permission) => ({ repositoryId: permission.repository_id, decision: permission.decision, inherited: permission.decided_by_job_id !== row.id })),
     };
     if (row.conversation_context) Object.defineProperty(job, 'conversationContext', { value: row.conversation_context, enumerable: false });
     return job;
   }
 
   scopeState(id: string): string | undefined { return (this.db.prepare('SELECT scope_state FROM jobs WHERE id = ?').get(id) as { scope_state: string } | undefined)?.scope_state; }
+  hasScopeDecision(id: string): boolean { return Boolean(this.db.prepare('SELECT 1 FROM scope_decisions WHERE job_id=?').get(id)); }
+
+  threadPermissionIds(id: string, decision: 'approved' | 'rejected'): string[] {
+    const job = this.getJob(id); if (!job) return [];
+    return (this.db.prepare('SELECT repository_id FROM thread_repository_permissions WHERE thread_id=? AND project_id=? AND decision=? ORDER BY rowid')
+      .all(job.threadId, job.projectId, decision) as Array<{ repository_id: string }>).map((row) => row.repository_id);
+  }
+
+  private setThreadPermissions(job: Job, repositoryIds: string[], decision: 'approved' | 'rejected'): void {
+    const statement = this.db.prepare(`INSERT INTO thread_repository_permissions(thread_id,project_id,repository_id,decision,decided_by_job_id,updated_at)
+      VALUES (?,?,?,?,?,?) ON CONFLICT(thread_id,repository_id) DO UPDATE SET
+      decision=excluded.decision,decided_by_job_id=excluded.decided_by_job_id,updated_at=excluded.updated_at
+      WHERE thread_repository_permissions.project_id=excluded.project_id`);
+    const now = new Date().toISOString();
+    for (const repositoryId of repositoryIds) statement.run(job.threadId, job.projectId, repositoryId, decision, job.id, now);
+  }
+
+  applyInitialThreadScope(id: string, repositoryIds: string[], manualExact = false): void {
+    const job = this.getJob(id); if (!job) return;
+    this.setThreadPermissions(job, repositoryIds, 'approved');
+    if (manualExact) {
+      const revoked = this.threadPermissionIds(id, 'approved').filter((repositoryId) => !repositoryIds.includes(repositoryId));
+      this.setThreadPermissions(job, revoked, 'rejected');
+    }
+  }
 
   resolveScope(id: string, repositoryIds: string[], reasons: ScopeReason[], state = 'resolved'): void {
     this.db.exec('BEGIN IMMEDIATE');
@@ -286,10 +332,24 @@ export class Store {
   }
 
   decideScope(id: string, approve: boolean, chosenRepositoryIds?: string[]): Job | undefined {
+    const prior = this.db.prepare('SELECT 1 FROM scope_decisions WHERE job_id=?').get(id);
+    if (prior) return this.getJob(id);
     const state = this.scopeState(id); const job = this.getJob(id); if (!job || job.status !== 'needs_input' || !['awaiting_decision', 'awaiting_correction'].includes(state ?? '')) return undefined;
     if (chosenRepositoryIds && !this.repositoriesBelongTo(job.projectId, chosenRepositoryIds)) return undefined;
-    const resolved = chosenRepositoryIds ?? (approve ? (state === 'awaiting_correction' ? (job.proposedRepositoryIds ?? []) : [...new Set([...job.requestedRepositoryIds, ...(job.proposedRepositoryIds ?? [])])]) : job.requestedRepositoryIds);
+    const proposed = job.proposedRepositoryIds ?? [];
+    const resolved = chosenRepositoryIds ?? (approve ? [...new Set([...job.resolvedRepositoryIds, ...proposed])] : job.resolvedRepositoryIds);
     const reasons = job.scopeReasons.filter((reason) => resolved.includes(reason.repositoryId));
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const decision = chosenRepositoryIds ? 'choose' : approve ? 'approve' : 'reject';
+      this.db.prepare('INSERT OR IGNORE INTO scope_decisions VALUES (?,?,?,?)').run(id, decision, JSON.stringify(chosenRepositoryIds ?? proposed), new Date().toISOString());
+      if (chosenRepositoryIds) {
+        this.setThreadPermissions(job, chosenRepositoryIds, 'approved');
+        const revoked = this.threadPermissionIds(id, 'approved').filter((repositoryId) => !chosenRepositoryIds.includes(repositoryId));
+        this.setThreadPermissions(job, revoked, 'rejected');
+      } else this.setThreadPermissions(job, proposed, approve ? 'approved' : 'rejected');
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     this.resolveScope(id, resolved, reasons, 'resolved'); this.setStatus(id, 'queued'); return this.getJob(id);
   }
 
@@ -372,7 +432,7 @@ export class Store {
       if (latest.id !== parentId) { this.db.exec('ROLLBACK'); return { conflict: 'not_latest' }; }
       const active = this.db.prepare("SELECT id FROM jobs WHERE thread_id = ? AND status IN ('queued','running','needs_input') LIMIT 1").get(threadId);
       if (active) { this.db.exec('ROLLBACK'); return { conflict: 'thread_active' }; }
-      const inheritedRepositoryIds = (this.db.prepare('SELECT repository_id FROM job_repositories WHERE job_id = ? ORDER BY rowid').all(parentId) as unknown as Array<{ repository_id: string }>).map((row) => row.repository_id);
+      const inheritedRepositoryIds = (this.db.prepare("SELECT repository_id FROM thread_repository_permissions WHERE thread_id=? AND project_id=? AND decision='approved' ORDER BY rowid").all(threadId, parentRow.project_id) as Array<{ repository_id: string }>).map((row) => row.repository_id);
       const repositoryIds = scopeMode === 'manual' ? requestedRepositoryIds! : inheritedRepositoryIds;
       if (!this.repositoriesBelongTo(parentRow.project_id, repositoryIds)) { this.db.exec('ROLLBACK'); return { conflict: 'scope_invalid' }; }
       const id = crypto.randomUUID(); const now = new Date().toISOString();
@@ -388,6 +448,12 @@ export class Store {
       const insertRequested = this.db.prepare('INSERT INTO job_requested_repositories VALUES (?, ?)');
       if (!replan) for (const repositoryId of repositoryIds) insertRequested.run(id, repositoryId);
       this.addEvent(id, 'status', 'Follow-up queued', { status: 'queued', parentJobId: parentId, threadId });
+      if (scopeMode === 'manual') {
+        const job = this.getJob(id)!;
+        this.setThreadPermissions(job, repositoryIds, 'approved');
+        const revoked = this.threadPermissionIds(id, 'approved').filter((repositoryId) => !repositoryIds.includes(repositoryId));
+        this.setThreadPermissions(job, revoked, 'rejected');
+      }
       this.db.exec('COMMIT'); return { job: this.getJob(id)! };
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }

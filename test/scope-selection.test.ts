@@ -120,7 +120,7 @@ test('auto structured insufficient-scope results request approval without silent
   assert.deepEqual(store.getJob(job.id)?.proposedRepositoryIds, [project.repositories[1].id]);
   await worker.stop();
   const corrected = store.decideScope(job.id, true);
-  assert.deepEqual(corrected?.resolvedRepositoryIds, [project.repositories[1].id]);
+  assert.deepEqual(corrected?.resolvedRepositoryIds, project.repositories.map((repository) => repository.id));
   store.close();
 });
 

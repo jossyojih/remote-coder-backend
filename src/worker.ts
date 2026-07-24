@@ -71,8 +71,25 @@ export class JobWorker {
     const state = this.store.scopeState(job.id);
     if (state === 'awaiting_decision' || state === 'awaiting_correction') return true;
     const data = event.data as { suggestedRepositoryIds?: unknown; reasons?: unknown };
-    const suggested = Array.isArray(data?.suggestedRepositoryIds) ? data.suggestedRepositoryIds.filter((id): id is string => typeof id === 'string') : [];
-    if (!suggested.length || !this.store.repositoriesBelongTo(job.projectId, suggested)) throw new Error('Agent returned an invalid scope-required result');
+    const rawSuggested = Array.isArray(data?.suggestedRepositoryIds) ? [...new Set(data.suggestedRepositoryIds.filter((id): id is string => typeof id === 'string'))] : [];
+    if (!rawSuggested.length || !this.store.repositoriesBelongTo(job.projectId, rawSuggested)) throw new Error('Agent returned an invalid scope-required result');
+    const approved = this.store.threadPermissionIds(job.id, 'approved');
+    const rejected = this.store.threadPermissionIds(job.id, 'rejected');
+    const inherited = rawSuggested.filter((id) => approved.includes(id) && !job.resolvedRepositoryIds.includes(id));
+    if (inherited.length) {
+      const resolved = [...new Set([...job.resolvedRepositoryIds, ...inherited])];
+      this.store.resolveScope(job.id, resolved, job.scopeReasons);
+    }
+    const suggested = rawSuggested.filter((id) => !approved.includes(id) && !rejected.includes(id));
+    if (!suggested.length) {
+      if (inherited.length) {
+        this.store.setStatus(job.id, 'queued');
+        this.emit(job.id, 'scope_inherited', 'Previously approved repository scope inherited', { repositoryIds: inherited });
+        this.wake();
+        return true;
+      }
+      return false;
+    }
     const supplied = Array.isArray(data.reasons) ? data.reasons as import('./types.js').ScopeReason[] : [];
     const reasons = suggested.map((repositoryId) => supplied.find((reason) => reason.repositoryId === repositoryId && typeof reason.reason === 'string' && reason.reason.trim()) ?? { repositoryId, reason: 'The selected scope was insufficient for the requested work.' });
     this.store.proposeScope(job.id, suggested, reasons, 'awaiting_correction');
@@ -90,14 +107,28 @@ export class JobWorker {
       let current = job;
       if (this.store.scopeState(job.id) === 'pending') {
         const project = this.store.getProject(job.projectId); if (!project) throw new Error('Project no longer exists');
-        const plan = job.scopeMode === 'all'
+        let plan = job.scopeMode === 'all'
           ? { repositoryIds: project.repositories.map((repository) => repository.id), reasons: project.repositories.map((repository) => ({ repositoryId: repository.id, reason: 'All repositories were explicitly granted for this job.' })) }
           : job.scopeMode === 'manual'
             ? { repositoryIds: job.requestedRepositoryIds, reasons: job.requestedRepositoryIds.map((repositoryId) => ({ repositoryId, reason: 'Explicitly selected for manual scope.' })) }
             : this.planner.plan(job.prompt.slice(0, 100_000), project.repositories);
+        if (job.scopeMode === 'auto') {
+          const rejected = this.store.threadPermissionIds(job.id, 'rejected');
+          plan = {
+            repositoryIds: plan.repositoryIds.filter((repositoryId) => !rejected.includes(repositoryId)),
+            reasons: plan.reasons.filter((reason) => !rejected.includes(reason.repositoryId)),
+          };
+        }
         if (job.scopeMode === 'manual') {
           this.store.resolveScope(job.id, plan.repositoryIds, plan.reasons);
         } else this.store.resolveScope(job.id, plan.repositoryIds, plan.reasons);
+        const inherited = this.store.threadPermissionIds(job.id, 'approved');
+        const resolved = [...new Set([...inherited, ...plan.repositoryIds])];
+        if (resolved.length !== plan.repositoryIds.length) this.store.resolveScope(job.id, resolved, [
+          ...plan.reasons,
+          ...inherited.filter((repositoryId) => !plan.repositoryIds.includes(repositoryId)).map((repositoryId) => ({ repositoryId, reason: 'Approved earlier in this conversation.' })),
+        ]);
+        this.store.applyInitialThreadScope(job.id, resolved, job.scopeMode === 'manual');
         current = this.store.getJob(job.id)!;
         this.emit(job.id, 'scope_resolved', `Resolved repository scope to ${current.resolvedRepositoryIds.length} repository${current.resolvedRepositoryIds.length === 1 ? '' : 'ies'}`, { scopeMode: current.scopeMode, requestedRepositoryIds: current.requestedRepositoryIds, resolvedRepositoryIds: current.resolvedRepositoryIds, reasons: current.scopeReasons });
       }

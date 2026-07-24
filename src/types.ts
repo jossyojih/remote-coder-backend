@@ -11,6 +11,11 @@ export type Agent = 'mock' | 'codex' | 'claude';
 export type ReasoningLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface AgentSelection { agent: Agent; model: string; reasoningLevel?: ReasoningLevel }
 export interface ScopeReason { repositoryId: string; reason: string }
+export interface ThreadRepositoryPermission {
+  repositoryId: string;
+  decision: 'approved' | 'rejected';
+  inherited: boolean;
+}
 
 export interface Project {
   id: string;
@@ -62,6 +67,7 @@ export interface Job {
   error?: string;
   question?: string;
   repositoryScopeCandidates?: Array<{ repositoryId: string; repositoryName: string; role: string }>;
+  threadRepositoryPermissions: ThreadRepositoryPermission[];
 }
 
 export interface ArchivedThread {
