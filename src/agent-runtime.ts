@@ -16,14 +16,28 @@ export function childEnvironment(provider?: 'codex' | 'claude'): NodeJS.ProcessE
   return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]])) as NodeJS.ProcessEnv;
 }
 
-export function runCommand(command: string, args: string[], cwd?: string): Promise<{ stdout: string; stderr: string }> {
+export function runCommand(command: string, args: string[], cwd?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env: childEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = '';
+    let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, timeoutMs);
+      timer.unref();
+    }
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', (code) => code === 0 ? resolve({ stdout, stderr }) : reject(new Error(`${command} ${args[0] ?? ''} failed (${code}): ${stderr.trim()}`)));
+    child.once('error', (error) => { if (timer) clearTimeout(timer); reject(error); });
+    child.once('close', (code) => {
+      if (timer) clearTimeout(timer);
+      if (timedOut) reject(new Error(`${command} ${args[0] ?? ''} timed out`));
+      else if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(`${command} ${args[0] ?? ''} failed (${code}): ${stderr.trim()}`));
+    });
   });
 }
 

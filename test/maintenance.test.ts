@@ -55,7 +55,7 @@ describe('MaintenanceService', () => {
     nowValue = Date.now();
   });
 
-  function createTestMaintenance(overrides: Partial<{ intervalMs: number; terminalGracePeriodMs: number; failedRetentionMs: number; batchLimit: number; cleanupEnabled: boolean }> = {}) {
+  function createTestMaintenance(overrides: Partial<{ intervalMs: number; terminalGracePeriodMs: number; failedRetentionMs: number; batchLimit: number; cleanupEnabled: boolean; listWorktrees: (sourcePath: string, timeoutMs: number) => Promise<string> }> = {}) {
     return new MaintenanceService(
       store,
       {
@@ -70,6 +70,8 @@ describe('MaintenanceService', () => {
       },
       { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as any,
       () => nowValue,
+      undefined,
+      overrides.listWorktrees,
     );
   }
 
@@ -126,22 +128,17 @@ describe('MaintenanceService', () => {
     assert.match(protectedItem.reason, /active/i);
   });
 
-  it('should clean completed jobs with no changes', async () => {
+  it('protects completed jobs whose cleanliness is not stored in database metadata', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
     const { jobId, worktreePath } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
 
     const maintenance = createTestMaintenance();
     const previewBefore = await maintenance.previewCleanup();
 
-    const eligibleItem = previewBefore.eligible.find((e) => e.jobId === jobId);
-    assert.ok(eligibleItem, 'done job with no changes should be eligible');
-    assert.match(eligibleItem.reason, /no changes/i);
-
-    await maintenance.triggerMaintenance();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    const runs = store.repositoryRuns(jobId);
-    assert.equal(runs.length, 0, 'worktree record should be removed');
+    const protectedItem = previewBefore.protectedWorktrees.find((item) => item.jobId === jobId);
+    assert.ok(protectedItem, 'unverifiable cleanliness must be protected');
+    assert.match(protectedItem.reason, /not verified/i);
+    assert.equal(store.repositoryRuns(jobId).length, 1, 'preview must not delete the worktree record');
   });
 
   it('should protect pending review jobs', async () => {
@@ -393,11 +390,11 @@ describe('MaintenanceService', () => {
     assert.equal(preview.retainedWorktreeCount, 4);
     assert.equal(preview.classifiedWorktreeCount, 4);
     assert.equal(preview.eligible.length + preview.protectedWorktrees.length, preview.retainedWorktreeCount);
-    assert.equal(preview.protectedWorktrees.length, 3);
+    assert.equal(preview.protectedWorktrees.length, 4);
     assert.ok(preview.protectedWorktrees.every((item) => item.reason.length > 0));
     assert.ok(preview.protectedWorktrees.some((item) => /not a registered/i.test(item.reason)));
     assert.ok(preview.protectedWorktrees.some((item) => /outside/i.test(item.reason)));
-    assert.ok(preview.protectedWorktrees.some((item) => /path resolution failed/i.test(item.reason)));
+    assert.ok(preview.protectedWorktrees.some((item) => /could not be safely verified/i.test(item.reason)));
   });
 
   it('should clean cancelled jobs after grace period', async () => {
@@ -425,8 +422,7 @@ describe('MaintenanceService', () => {
     const maintenance = createTestMaintenance({ cleanupEnabled: false });
 
     const previewBefore = await maintenance.previewCleanup();
-    const eligibleItem = previewBefore.eligible.find((e) => e.jobId === jobId);
-    assert.ok(eligibleItem, 'done job should be eligible even when cleanup disabled');
+    assert.equal(previewBefore.classifiedWorktreeCount, 1);
 
     await maintenance.triggerMaintenance();
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -469,7 +465,10 @@ describe('MaintenanceService', () => {
 
   it('should still calculate eligibility when cleanup is disabled', async () => {
     const project = store.createProject('Test', [{ name: 'Backend', path: backendSource }]);
-    await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const promoted = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'done');
+    const promotedRuns = store.repositoryRuns(promoted.jobId);
+    store.beginPromotion(promoted.jobId, 'promoted', promotedRuns);
+    store.setPromotionRepository(promoted.jobId, project.repositories[0]!.id, 'promoted', { commitSha: 'abc123' });
     await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'running');
 
     const maintenance = createTestMaintenance({ cleanupEnabled: false });
@@ -477,5 +476,61 @@ describe('MaintenanceService', () => {
 
     assert.ok(preview.eligible.length > 0, 'should still calculate eligible worktrees');
     assert.ok(preview.protectedWorktrees.length > 0, 'should still calculate protected worktrees');
+  });
+
+  it('classifies at least 100 retained worktrees within 15 seconds and deletes nothing', async () => {
+    const project = store.createProject('Scale', [{ name: 'Backend', path: backendSource }]);
+    const registered = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'failed');
+    const template = store.repositoryRuns(registered.jobId)[0]!;
+    nowValue += 8 * 24 * 60 * 60 * 1000;
+
+    for (let index = 1; index < 100; index++) {
+      const job = store.createJob(project.id, `Scale ${index}`, [project.repositories[0]!.id], 'mock', 'manual');
+      store.setStatus(job.id, 'failed');
+      store.recordRepositoryRun({ ...template, jobId: job.id, branch: `scale-${index}` });
+    }
+
+    const before = store.allRepositoryRuns().length;
+    const startedAt = Date.now();
+    const preview = await createTestMaintenance({ cleanupEnabled: false }).previewCleanup();
+
+    assert.ok(Date.now() - startedAt < 15_000);
+    assert.equal(preview.retainedWorktreeCount, before);
+    assert.equal(preview.eligible.length + preview.protectedWorktrees.length, before);
+    assert.equal(store.allRepositoryRuns().length, before, 'preview must not delete database records');
+    assert.ok(existsSync(template.worktreePath), 'preview must not delete filesystem worktrees');
+  });
+
+  it('protects all worktrees when git registration verification times out', async () => {
+    const project = store.createProject('Timeout', [{ name: 'Backend', path: backendSource }]);
+    const { jobId } = await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'failed');
+    const maintenance = createTestMaintenance({
+      listWorktrees: async () => {
+        throw new Error('git worktree list timed out');
+      },
+    });
+
+    const preview = await maintenance.previewCleanup();
+    const item = preview.protectedWorktrees.find((entry) => entry.jobId === jobId);
+    assert.ok(item);
+    assert.match(item.reason, /timed out/i);
+  });
+
+  it('returns the most recent preview from cache without recomputing it', async () => {
+    const project = store.createProject('Cache', [{ name: 'Backend', path: backendSource }]);
+    await createJobWithWorktree(project.repositories[0]!.id, backendSource, 'running');
+    let listCalls = 0;
+    const maintenance = createTestMaintenance({
+      listWorktrees: async (sourcePath) => {
+        listCalls++;
+        return (await git(sourcePath, ['worktree', 'list', '--porcelain']));
+      },
+    });
+
+    const fresh = await maintenance.previewCleanup();
+    const cached = maintenance.getCachedPreview();
+    assert.deepEqual(cached, fresh);
+    assert.equal(listCalls, 1);
+    assert.ok(cached.generatedAt);
   });
 });

@@ -356,14 +356,25 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       retainedWorktreeBytes: status.retainedWorktreeBytes,
       diskUsageBytes: status.diskUsageBytes,
       archivedThreads: status.archivedThreads,
+      lastPreviewAt: status.lastPreviewAt,
     };
   });
 
   app.get('/maintenance/preview', async () => {
+    const preview = maintenance.getCachedPreview();
+    return {
+      ...preview,
+      eligible: preview.eligible.map(({ worktreePath: _path, ...item }) => item),
+      protectedWorktrees: preview.protectedWorktrees.map(({ worktreePath: _path, ...item }) => item),
+    };
+  });
+
+  app.post('/maintenance/preview', async () => {
     const preview = await maintenance.previewCleanup();
     return {
       retainedWorktreeCount: preview.retainedWorktreeCount,
       classifiedWorktreeCount: preview.classifiedWorktreeCount,
+      generatedAt: preview.generatedAt,
       eligible: preview.eligible.map((item) => ({
         jobId: item.jobId,
         repositoryId: item.repositoryId,

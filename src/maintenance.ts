@@ -1,4 +1,4 @@
-import { readdir, stat, rm } from 'node:fs/promises';
+import { readdir, stat, rm, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, basename } from 'node:path';
 import type { FastifyBaseLogger } from 'fastify';
@@ -31,6 +31,7 @@ export interface MaintenanceStatus {
   archivedThreads: number;
   retainedWorktreeCount: number;
   retainedWorktreeBytes?: number;
+  lastPreviewAt?: string;
 }
 
 export interface CleanupResult {
@@ -55,14 +56,45 @@ export type CleanupEligibility =
   | { eligible: false; reason: string }
   | { eligible: true; reason: string; reclaimedBytes: number };
 
-const PREVIEW_CLASSIFICATION_TIMEOUT_MS = 10_000;
+const PREVIEW_OPERATION_TIMEOUT_MS = 3_000;
+const PREVIEW_CONCURRENCY = 8;
 
 type PreviewResult = {
   eligible: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string; estimatedBytes: number }>;
   protectedWorktrees: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string }>;
   retainedWorktreeCount: number;
   classifiedWorktreeCount: number;
+  generatedAt?: string;
 };
+
+type RepositoryRun = ReturnType<Store['allRepositoryRuns']>[number];
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('operation timed out')), timeoutMs);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await mapper(items[index]!, index);
+    }
+  }));
+  return results;
+}
 
 function within(parent: string, child: string): boolean {
   const rel = relative(parent, child);
@@ -174,6 +206,13 @@ export class MaintenanceService {
   private running = false;
   private cleanupHistory: CleanupResult[] = [];
   private failureHistory: CleanupFailure[] = [];
+  private cachedPreview: PreviewResult = {
+    eligible: [],
+    protectedWorktrees: [],
+    retainedWorktreeCount: 0,
+    classifiedWorktreeCount: 0,
+  };
+  private worktreeSizeCache = new Map<string, number>();
 
   constructor(
     private readonly store: Store,
@@ -181,6 +220,8 @@ export class MaintenanceService {
     private readonly log: FastifyBaseLogger,
     private readonly now: () => number = Date.now,
     private readonly maintenanceRunOverride?: () => Promise<void>,
+    private readonly listWorktrees: (sourcePath: string, timeoutMs: number) => Promise<string> =
+      async (sourcePath, timeoutMs) => (await runCommand('git', ['worktree', 'list', '--porcelain'], sourcePath, timeoutMs)).stdout,
   ) {
     this.status.cleanupEnabled = config.cleanupEnabled;
   }
@@ -233,35 +274,62 @@ export class MaintenanceService {
     return { started: true };
   }
 
+  getCachedPreview(): PreviewResult {
+    return structuredClone(this.cachedPreview);
+  }
+
   async previewCleanup(): Promise<PreviewResult> {
     const runs = this.store.allRepositoryRuns();
     const eligible: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string; estimatedBytes: number }> = [];
     const protectedWorktrees: Array<{ jobId: string; repositoryId: string; worktreePath: string; reason: string }> = [];
 
-    const classifications = await Promise.all(runs.map(async (run): Promise<CleanupEligibility> => {
+    const resolvedRunsRoot = await withTimeout(realpath(this.config.runsRoot), PREVIEW_OPERATION_TIMEOUT_MS);
+    const sourcePaths = [...new Set(runs.map((run) => run.sourcePath))];
+    const registrations = new Map<string, { paths?: Set<string>; reason?: string }>();
+    await mapLimit(sourcePaths, 4, async (sourcePath) => {
+      try {
+        const sourceRealPath = await withTimeout(realpath(sourcePath), PREVIEW_OPERATION_TIMEOUT_MS);
+        const listed = await withTimeout(this.listWorktrees(sourceRealPath, PREVIEW_OPERATION_TIMEOUT_MS), PREVIEW_OPERATION_TIMEOUT_MS);
+        const paths = new Set(listed.split(/\r?\n/)
+          .filter((line) => line.startsWith('worktree '))
+          .map((line) => resolve(line.slice('worktree '.length))));
+        registrations.set(sourcePath, { paths });
+      } catch (error) {
+        registrations.set(sourcePath, {
+          reason: error instanceof Error && /timed out/i.test(error.message)
+            ? 'git worktree verification timed out; protected by default'
+            : 'source repository could not be verified; protected by default',
+        });
+      }
+    });
+
+    const classifications = await mapLimit(runs, PREVIEW_CONCURRENCY, async (run): Promise<CleanupEligibility> => {
       const job = this.store.getJob(run.jobId, true);
       if (job?.archivedAt) {
         return { eligible: false, reason: 'archived thread retained until archive purge' };
       }
-
-      let timer: NodeJS.Timeout | undefined;
       try {
-        return await Promise.race([
-          this.checkEligibility(run.jobId, run),
-          new Promise<CleanupEligibility>((resolve) => {
-            timer = setTimeout(
-              () => resolve({ eligible: false, reason: 'verification timed out; protected by default' }),
-              PREVIEW_CLASSIFICATION_TIMEOUT_MS,
-            );
-            timer.unref();
-          }),
-        ]);
-      } catch {
-        return { eligible: false, reason: 'verification failed; protected by default' };
-      } finally {
-        if (timer) clearTimeout(timer);
+        const resolvedWorktree = await withTimeout(realpath(run.worktreePath), PREVIEW_OPERATION_TIMEOUT_MS);
+        if (!within(resolvedRunsRoot, resolvedWorktree)) {
+          return { eligible: false, reason: 'worktree is outside the configured runs root' };
+        }
+        const registration = registrations.get(run.sourcePath);
+        if (!registration || registration.reason) {
+          return { eligible: false, reason: registration?.reason ?? 'worktree registration is unknown; protected by default' };
+        }
+        if (!registration.paths?.has(resolvedWorktree)) {
+          return { eligible: false, reason: 'not a registered git worktree for its source repository' };
+        }
+        return this.checkMetadataEligibility(run);
+      } catch (error) {
+        return {
+          eligible: false,
+          reason: error instanceof Error && /timed out/i.test(error.message)
+            ? 'worktree path verification timed out; protected by default'
+            : 'worktree path could not be safely verified; protected by default',
+        };
       }
-    }));
+    });
 
     for (const [index, run] of runs.entries()) {
       const result = classifications[index] ?? { eligible: false as const, reason: 'classification unavailable; protected by default' };
@@ -284,10 +352,46 @@ export class MaintenanceService {
     }
 
     const classifiedWorktreeCount = eligible.length + protectedWorktrees.length;
+    const generatedAt = new Date(this.now()).toISOString();
     this.status.eligibleWorktrees = eligible.length;
     this.status.protectedWorktrees = protectedWorktrees.length;
     this.status.retainedWorktreeCount = runs.length;
-    return { eligible, protectedWorktrees, retainedWorktreeCount: runs.length, classifiedWorktreeCount };
+    this.status.lastPreviewAt = generatedAt;
+    this.cachedPreview = { eligible, protectedWorktrees, retainedWorktreeCount: runs.length, classifiedWorktreeCount, generatedAt };
+    return structuredClone(this.cachedPreview);
+  }
+
+  private checkMetadataEligibility(run: RepositoryRun): CleanupEligibility {
+    const job = this.store.getJob(run.jobId);
+    if (!job) return { eligible: false, reason: 'job metadata is unavailable; protected by default' };
+    if (['queued', 'running', 'needs_input'].includes(job.status)) {
+      return { eligible: false, reason: 'job is active' };
+    }
+    if (this.store.activeDeploymentsForJob(run.jobId).length > 0) {
+      return { eligible: false, reason: 'deployment in progress' };
+    }
+    const repository = this.store.repositories([run.repositoryId])[0];
+    if (!repository) return { eligible: false, reason: 'repository metadata is unavailable; protected by default' };
+    const promotion = this.store.getPromotion(run.jobId);
+    const repositoryPromotion = promotion?.repositories.find((item) => item.repositoryId === run.repositoryId);
+    const estimatedBytes = this.worktreeSizeCache.get(run.worktreePath) ?? 0;
+    if (repositoryPromotion?.status === 'promoted') {
+      return { eligible: true, reason: repository.effectivePromotionPolicy === 'auto_push' ? 'auto-pushed' : 'successfully promoted', reclaimedBytes: estimatedBytes };
+    }
+    if (repository.effectivePromotionPolicy === 'read_only' && job.status === 'done') {
+      return { eligible: true, reason: 'read-only repository completed', reclaimedBytes: estimatedBytes };
+    }
+    if (['failed', 'cancelled'].includes(job.status)) {
+      const retentionMs = job.status === 'failed' ? this.config.failedRetentionMs : this.config.terminalGracePeriodMs;
+      if (this.now() >= new Date(job.updatedAt).getTime() + retentionMs) {
+        return { eligible: true, reason: `${job.status} after retention period`, reclaimedBytes: estimatedBytes };
+      }
+      return { eligible: false, reason: `${job.status} within retention period` };
+    }
+    if (job.status === 'done') {
+      return { eligible: false, reason: promotion ? 'promotion is not complete' : 'pending review; cleanliness is not verified during preview' };
+    }
+    return { eligible: false, reason: 'retention eligibility is unknown; protected by default' };
   }
 
   private async runMaintenance(): Promise<void> {
@@ -311,6 +415,7 @@ export class MaintenanceService {
       }
 
       this.status.lastRunCompletedAt = new Date(this.now()).toISOString();
+      await this.previewCleanup();
       this.log.info({
         cleaned: this.status.lastCleanedCount,
         failed: this.status.lastFailedCount,
@@ -523,17 +628,15 @@ export class MaintenanceService {
 
     try {
       let totalBytes = 0;
-      for (const run of runs) {
-        try {
-          const size = await dirSize(run.worktreePath);
-          totalBytes += size;
-        } catch {
-          // Skip inaccessible worktrees
-        }
-      }
+      const sizes = await mapLimit(runs, PREVIEW_CONCURRENCY, async (run) => {
+        const size = await withTimeout(dirSize(run.worktreePath), PREVIEW_OPERATION_TIMEOUT_MS).catch(() => 0);
+        this.worktreeSizeCache.set(run.worktreePath, size);
+        return size;
+      });
+      totalBytes = sizes.reduce((sum, size) => sum + size, 0);
       this.status.retainedWorktreeBytes = totalBytes;
 
-      this.status.diskUsageBytes = await dirSize(this.config.runsRoot);
+      this.status.diskUsageBytes = await withTimeout(dirSize(this.config.runsRoot), PREVIEW_OPERATION_TIMEOUT_MS);
     } catch (error) {
       this.log.debug({ err: error }, 'failed to update storage metrics');
     }

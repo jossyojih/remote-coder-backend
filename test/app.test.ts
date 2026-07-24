@@ -49,6 +49,13 @@ test('maintenance APIs enforce cleanup policy and never expose worktree paths', 
   assert.equal((await app.inject({ method: 'POST', url: '/maintenance/cleanup', headers: auth })).statusCode, 403);
   assert.equal((await app.inject({ url: '/maintenance/status' })).statusCode, 401);
 
+  const initialPreview = (await app.inject({ url: '/maintenance/preview', headers: auth })).json();
+  assert.equal(initialPreview.generatedAt, undefined, 'GET should return cache without starting a preview');
+  const generatedPreview = (await app.inject({ method: 'POST', url: '/maintenance/preview', headers: auth })).json();
+  assert.ok(generatedPreview.generatedAt, 'POST should explicitly generate a preview');
+  const cachedPreview = (await app.inject({ url: '/maintenance/preview', headers: auth })).json();
+  assert.equal(cachedPreview.generatedAt, generatedPreview.generatedAt);
+
   const internal = maintenance as unknown as {
     cleanupHistory: Array<Record<string, unknown>>;
     failureHistory: Array<Record<string, unknown>>;
