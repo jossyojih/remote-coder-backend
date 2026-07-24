@@ -3,8 +3,8 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { AgentSelection, ArchivedThread, Deployment, DeploymentClaim, DeploymentStatus, Job, JobEvent, JobRepositoryRun, JobStatus, Project, Promotion, PromotionPolicy, PromotionStatus, Repository, ScopeMode, ScopeReason, ThreadSearchResult, ThreadSearchFilters } from './types.js';
 
-type ProjectRow = { id: string; name: string; created_at: string; promotion_policy: PromotionPolicy; default_agent: AgentSelection['agent'] | null; default_model: string | null; default_reasoning_level: AgentSelection['reasoningLevel'] | null };
-type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; promotion_policy_override?: PromotionPolicy | null; created_at: string };
+type ProjectRow = { id: string; name: string; description: string | null; created_at: string; promotion_policy: PromotionPolicy; default_agent: AgentSelection['agent'] | null; default_model: string | null; default_reasoning_level: AgentSelection['reasoningLevel'] | null };
+type RepoRow = { id: string; project_id: string; name: string; path: string; remote_name?: string; target_branch?: string | null; promotion_policy_override?: PromotionPolicy | null; normalized_url?: string | null; created_at: string };
 type JobRow = { id: string; project_id: string; prompt: string; agent: AgentSelection['agent']; model: string | null; reasoning_level: AgentSelection['reasoningLevel'] | null; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string; archived_at: string | null; purge_after: string | null };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
@@ -75,8 +75,10 @@ export class Store {
     if (!repositoryColumns.some((column) => column.name === 'remote_name')) this.db.exec("ALTER TABLE repositories ADD COLUMN remote_name TEXT NOT NULL DEFAULT 'origin'");
     if (!repositoryColumns.some((column) => column.name === 'target_branch')) this.db.exec('ALTER TABLE repositories ADD COLUMN target_branch TEXT');
     if (!repositoryColumns.some((column) => column.name === 'promotion_policy_override')) this.db.exec("ALTER TABLE repositories ADD COLUMN promotion_policy_override TEXT CHECK(promotion_policy_override IN ('review_required','auto_push','read_only'))");
+    if (!repositoryColumns.some((column) => column.name === 'normalized_url')) this.db.exec('ALTER TABLE repositories ADD COLUMN normalized_url TEXT');
     const projectColumns = this.db.prepare('PRAGMA table_info(projects)').all() as unknown as Array<{ name: string }>;
     if (!projectColumns.some((column) => column.name === 'promotion_policy')) this.db.exec("ALTER TABLE projects ADD COLUMN promotion_policy TEXT NOT NULL DEFAULT 'review_required' CHECK(promotion_policy IN ('review_required','auto_push','read_only'))");
+    if (!projectColumns.some((column) => column.name === 'description')) this.db.exec('ALTER TABLE projects ADD COLUMN description TEXT');
     if (!projectColumns.some((column) => column.name === 'default_agent')) this.db.exec('ALTER TABLE projects ADD COLUMN default_agent TEXT');
     if (!projectColumns.some((column) => column.name === 'default_model')) this.db.exec('ALTER TABLE projects ADD COLUMN default_model TEXT');
     if (!projectColumns.some((column) => column.name === 'default_reasoning_level')) this.db.exec('ALTER TABLE projects ADD COLUMN default_reasoning_level TEXT');
@@ -291,17 +293,49 @@ export class Store {
     this.db.prepare("UPDATE jobs SET model='mock' WHERE agent='mock' AND (model IS NULL OR model='')").run();
   }
 
-  createProject(name: string, repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string }>): Project {
+  createProject(name: string, repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string }>, description?: string, promotionPolicy?: string, defaultAgent?: string, defaultModel?: string): Project {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.prepare('INSERT INTO projects(id,name,created_at,promotion_policy) VALUES (?, ?, ?, ?)').run(id, name, now, 'review_required');
-      const insert = this.db.prepare('INSERT INTO repositories(id,project_id,name,path,created_at,remote_name,target_branch) VALUES (?, ?, ?, ?, ?, ?, ?)');
-      for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now, repo.remoteName ?? 'origin', repo.targetBranch ?? null);
+      this.db.prepare('INSERT INTO projects(id,name,created_at,promotion_policy,description,default_agent,default_model) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, name, now, promotionPolicy ?? 'review_required', description ?? null, defaultAgent ?? null, defaultModel ?? null);
+      const insert = this.db.prepare('INSERT INTO repositories(id,project_id,name,path,created_at,remote_name,target_branch,normalized_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+      for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now, repo.remoteName ?? 'origin', repo.targetBranch ?? null, null);
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     return this.getProject(id)!;
+  }
+
+  updateProject(id: string, input: { name?: string; description?: string }): Project | undefined {
+    const updates: string[] = [];
+    const params: (string | null)[] = [];
+    if (input.name !== undefined) { updates.push('name=?'); params.push(input.name); }
+    if (input.description !== undefined) { updates.push('description=?'); params.push(input.description || null); }
+    if (updates.length === 0) return this.getProject(id);
+    params.push(id);
+    const result = this.db.prepare(`UPDATE projects SET ${updates.join(',')} WHERE id=?`).run(...params);
+    return Number(result.changes) ? this.getProject(id) : undefined;
+  }
+
+  findRepositoryByNormalizedUrl(normalizedUrl: string, projectId?: string): { id: string; projectId: string } | undefined {
+    const query = projectId
+      ? 'SELECT id, project_id FROM repositories WHERE normalized_url=? AND project_id=? LIMIT 1'
+      : 'SELECT id, project_id FROM repositories WHERE normalized_url=? LIMIT 1';
+    const row = projectId
+      ? this.db.prepare(query).get(normalizedUrl, projectId) as { id: string; project_id: string } | undefined
+      : this.db.prepare(query).get(normalizedUrl) as { id: string; project_id: string } | undefined;
+    return row ? { id: row.id, projectId: row.project_id } : undefined;
+  }
+
+  addRepository(projectId: string, name: string, path: string, remoteName: string, targetBranch: string, normalizedUrl: string): { id: string; projectId: string; name: string; path: string; remoteName: string; targetBranch: string; normalizedUrl: string; createdAt: string; status: string } {
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    this.db.prepare('INSERT INTO repositories(id,project_id,name,path,created_at,remote_name,target_branch,normalized_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, projectId, name, path, now, remoteName, targetBranch, normalizedUrl);
+    return { id, projectId, name, path, remoteName, targetBranch, normalizedUrl, createdAt: now, status: 'connected' };
+  }
+
+  activeJobsForProject(projectId: string): Array<{ id: string }> {
+    return this.db.prepare("SELECT id FROM jobs WHERE project_id=? AND status IN ('queued','running','needs_input') AND archived_at IS NULL LIMIT 1").all(projectId) as Array<{ id: string }>;
   }
 
   listProjects(): Project[] {
@@ -316,7 +350,7 @@ export class Store {
 
   private mapProject(row: ProjectRow): Project {
     const repos = this.db.prepare('SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, name').all(row.id) as unknown as RepoRow[];
-    return { id: row.id, name: row.name, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', defaultAgent: row.default_agent ?? undefined, defaultModel: row.default_model ?? undefined, defaultReasoningLevel: row.default_reasoning_level ?? undefined, repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required')) };
+    return { id: row.id, name: row.name, description: row.description ?? undefined, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', defaultAgent: row.default_agent ?? undefined, defaultModel: row.default_model ?? undefined, defaultReasoningLevel: row.default_reasoning_level ?? undefined, repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required')) };
   }
 
   private mapRepo = (row: RepoRow, projectPolicy?: PromotionPolicy): Repository => {

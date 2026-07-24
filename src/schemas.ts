@@ -10,12 +10,30 @@ export const updateProjectAgentDefaultsSchema = agentSelectionSchema.refine((val
 
 export const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(200),
+  description: z.string().trim().max(1000).optional(),
+  defaultAgent: z.enum(['mock', 'codex', 'claude']).optional(),
+  defaultModel: z.string().max(128).optional(),
+  promotionPolicy: promotionPolicySchema.optional(),
   repositories: z.array(z.object({
     name: z.string().trim().min(1).max(200),
     path: z.string().trim().min(1),
     remoteName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).default('origin'),
     targetBranch: z.string().trim().min(1).max(255).optional(),
-  })).min(1),
+  })).optional().default([]),
+  repositoryUrls: z.array(z.object({
+    url: z.string().trim().min(1).max(2048),
+    name: z.string().trim().min(1).max(200).optional(),
+  })).max(20).optional().default([]),
+}).refine((value) => value.repositories.length > 0 || value.repositoryUrls.length > 0 || true, { message: 'Project creation requires no minimum repositories' });
+
+export const updateProjectSchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  description: z.string().trim().max(1000).optional(),
+});
+
+export const addRepositorySchema = z.object({
+  url: z.string().trim().min(1).max(2048),
+  name: z.string().trim().min(1).max(200).optional(),
 });
 
 export const attachmentMetadataSchema = z.object({

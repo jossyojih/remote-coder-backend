@@ -20,6 +20,7 @@ export interface ThreadRepositoryPermission {
 export interface Project {
   id: string;
   name: string;
+  description?: string;
   createdAt: string;
   promotionPolicy: PromotionPolicy;
   defaultAgent?: Agent;

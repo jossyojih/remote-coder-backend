@@ -7,7 +7,8 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, threadSearchSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
+import { addRepositorySchema, createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, threadSearchSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateProjectSchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
+import { cloneRepository, cleanupFailedClone, parseGitHubUrl, safeDirName, validateRepositoryUrl } from './repository-onboarding.js';
 import { buildCapabilities, validateSelection } from './capabilities.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
@@ -184,12 +185,67 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     if (!body || typeof body.password !== 'string' || !(await verifyPassword(body.password, appPasswordHash))) return reply.code(401).send({ error: 'Invalid credentials' });
     return issueAccessToken(appSessionSecret, appTokenTtlSeconds, now());
   });
+  const onboardingLocks = new Map<string, Promise<unknown>>();
+
   app.post('/projects', async (request, reply) => {
     const input = createProjectSchema.parse(request.body);
-    const repositories = input.repositories.map((repository) => ({ ...repository, path: validatedRepositoryPath(repository.path, workspaceRoot) }));
-    return reply.code(201).send(store.createProject(input.name, repositories));
+    const repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string }> = [];
+    for (const repository of input.repositories) {
+      repositories.push({ ...repository, path: validatedRepositoryPath(repository.path, workspaceRoot) });
+    }
+    for (const repoUrl of input.repositoryUrls ?? []) {
+      const validation = validateRepositoryUrl(repoUrl.url);
+      if (!validation.valid) return reply.code(400).send({ error: validation.error });
+      const existing = store.findRepositoryByNormalizedUrl(validation.normalized);
+      if (existing) return reply.code(409).send({ error: `Repository ${validation.owner}/${validation.repo} is already onboarded` });
+      const dirName = safeDirName(validation.owner, validation.repo);
+      const result = cloneRepository(validation.normalized, dirName, workspaceRoot);
+      repositories.push({
+        name: repoUrl.name || `${validation.owner}/${validation.repo}`,
+        path: result.clonePath,
+        targetBranch: result.defaultBranch,
+      });
+    }
+    const project = store.createProject(input.name, repositories, input.description, input.promotionPolicy, input.defaultAgent, input.defaultModel);
+    return reply.code(201).send(project);
+  });
+  app.put('/projects/:id', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const input = updateProjectSchema.parse(request.body);
+    const project = store.updateProject(id, input);
+    return project ?? reply.code(404).send({ error: 'Project not found' });
   });
   app.get('/projects', async () => store.listProjects());
+  app.post('/projects/:id/repositories', async (request, reply) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const project = store.getProject(id);
+    if (!project) return reply.code(404).send({ error: 'Project not found' });
+    const input = addRepositorySchema.parse(request.body);
+    const validation = validateRepositoryUrl(input.url);
+    if (!validation.valid) return reply.code(400).send({ error: validation.error });
+    const lockKey = `${id}:${validation.normalized}`;
+    if (onboardingLocks.has(lockKey)) return reply.code(409).send({ error: 'Repository onboarding already in progress' });
+    const existing = store.findRepositoryByNormalizedUrl(validation.normalized, id);
+    if (existing) return reply.code(409).send({ error: `Repository ${validation.owner}/${validation.repo} is already connected to this project` });
+    const activeJobs = store.activeJobsForProject(id);
+    if (activeJobs.length > 0) return reply.code(409).send({ error: 'Cannot add repositories while jobs are active' });
+    const dirName = safeDirName(validation.owner, validation.repo);
+    let onboardPromise: Promise<unknown>;
+    try {
+      onboardPromise = Promise.resolve();
+      onboardingLocks.set(lockKey, onboardPromise);
+      const result = cloneRepository(validation.normalized, dirName, workspaceRoot);
+      const name = input.name || `${validation.owner}/${validation.repo}`;
+      const repo = store.addRepository(id, name, result.clonePath, 'origin', result.defaultBranch, validation.normalized);
+      return reply.code(201).send(repo);
+    } catch (error) {
+      cleanupFailedClone(dirName, workspaceRoot);
+      const message = error instanceof Error ? error.message : 'Repository onboarding failed';
+      return reply.code(400).send({ error: message });
+    } finally {
+      onboardingLocks.delete(lockKey);
+    }
+  });
   app.get('/capabilities', async () => capabilities);
   app.get('/projects/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const project = store.getProject(id);
