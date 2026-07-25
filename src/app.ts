@@ -151,7 +151,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     }
     if (request.method === 'OPTIONS') {
       if (!origin) return reply.code(400).send({ error: 'Origin required' });
-      reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS').header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Last-Event-ID').header('Access-Control-Max-Age', '600');
+      reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS').header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Last-Event-ID').header('Access-Control-Max-Age', '600');
       return reply.code(204).send();
     }
     if (request.url === '/health' || request.url === '/auth/login') return;
