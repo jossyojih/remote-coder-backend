@@ -24,7 +24,13 @@ export const createProjectSchema = z.object({
     url: z.string().trim().min(1).max(2048),
     name: z.string().trim().min(1).max(200).optional(),
   })).max(20).optional().default([]),
-}).refine((value) => value.repositories.length > 0 || value.repositoryUrls.length > 0 || true, { message: 'Project creation requires no minimum repositories' });
+  githubRepositories: z.array(z.object({
+    owner: z.string().trim().min(1).max(100),
+    repo: z.string().trim().min(1).max(100),
+    name: z.string().trim().min(1).max(200).optional(),
+    defaultBranch: z.string().trim().min(1).max(255).optional(),
+  })).max(20).optional().default([]),
+}).refine((value) => value.repositories.length > 0 || value.repositoryUrls.length > 0 || value.githubRepositories.length > 0 || true, { message: 'Project creation requires no minimum repositories' });
 
 export const updateProjectSchema = z.object({
   name: z.string().trim().min(1).max(200).optional(),
@@ -32,8 +38,16 @@ export const updateProjectSchema = z.object({
 });
 
 export const addRepositorySchema = z.object({
-  url: z.string().trim().min(1).max(2048),
+  url: z.string().trim().min(1).max(2048).optional(),
   name: z.string().trim().min(1).max(200).optional(),
+  owner: z.string().trim().min(1).max(100).optional(),
+  repo: z.string().trim().min(1).max(100).optional(),
+  defaultBranch: z.string().trim().min(1).max(255).optional(),
+}).superRefine((value, context) => {
+  const hasUrl = !!value.url;
+  const hasGitHub = !!(value.owner && value.repo);
+  if (!hasUrl && !hasGitHub) context.addIssue({ code: 'custom', path: ['url'], message: 'Either url or owner+repo is required' });
+  if (hasUrl && hasGitHub) context.addIssue({ code: 'custom', path: ['url'], message: 'Cannot specify both url and owner+repo' });
 });
 
 export const attachmentMetadataSchema = z.object({

@@ -293,14 +293,14 @@ export class Store {
     this.db.prepare("UPDATE jobs SET model='mock' WHERE agent='mock' AND (model IS NULL OR model='')").run();
   }
 
-  createProject(name: string, repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string }>, description?: string, promotionPolicy?: string, defaultAgent?: string, defaultModel?: string): Project {
+  createProject(name: string, repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string; normalizedUrl?: string }>, description?: string, promotionPolicy?: string, defaultAgent?: string, defaultModel?: string): Project {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare('INSERT INTO projects(id,name,created_at,promotion_policy,description,default_agent,default_model) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, name, now, promotionPolicy ?? 'review_required', description ?? null, defaultAgent ?? null, defaultModel ?? null);
       const insert = this.db.prepare('INSERT INTO repositories(id,project_id,name,path,created_at,remote_name,target_branch,normalized_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-      for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now, repo.remoteName ?? 'origin', repo.targetBranch ?? null, null);
+      for (const repo of repositories) insert.run(crypto.randomUUID(), id, repo.name, repo.path, now, repo.remoteName ?? 'origin', repo.targetBranch ?? null, repo.normalizedUrl ?? null);
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     return this.getProject(id)!;
@@ -355,7 +355,7 @@ export class Store {
 
   private mapRepo = (row: RepoRow, projectPolicy?: PromotionPolicy): Repository => {
     const fallback = projectPolicy ?? (this.db.prepare('SELECT promotion_policy FROM projects WHERE id=?').get(row.project_id) as { promotion_policy: PromotionPolicy } | undefined)?.promotion_policy ?? 'review_required';
-    return { id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at, remoteName: row.remote_name ?? 'origin', targetBranch: row.target_branch ?? undefined, promotionPolicyOverride: row.promotion_policy_override ?? undefined, effectivePromotionPolicy: row.promotion_policy_override ?? fallback };
+    return { id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at, remoteName: row.remote_name ?? 'origin', targetBranch: row.target_branch ?? undefined, normalizedUrl: row.normalized_url ?? undefined, promotionPolicyOverride: row.promotion_policy_override ?? undefined, effectivePromotionPolicy: row.promotion_policy_override ?? fallback };
   };
 
   updateProjectPromotionPolicy(id: string, policy: PromotionPolicy): Project | undefined {

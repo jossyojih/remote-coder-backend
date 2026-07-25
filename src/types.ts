@@ -37,6 +37,7 @@ export interface Repository {
   createdAt: string;
   remoteName?: string;
   targetBranch?: string;
+  normalizedUrl?: string;
   promotionPolicyOverride?: PromotionPolicy;
   effectivePromotionPolicy: PromotionPolicy;
 }

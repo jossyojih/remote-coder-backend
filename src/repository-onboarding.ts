@@ -2,10 +2,15 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { cloneWithToken } from './git-credential-helper.js';
 
 export interface OnboardingResult {
   clonePath: string;
   defaultBranch: string;
+}
+
+export interface CloneOptions {
+  token?: string;
 }
 
 const GITHUB_URL_PATTERNS = [
@@ -54,7 +59,7 @@ export function validateClonePath(target: string, workspaceRoot: string): void {
   }
 }
 
-export function cloneRepository(url: string, target: string, workspaceRoot: string): OnboardingResult {
+export function cloneRepository(url: string, target: string, workspaceRoot: string, options?: CloneOptions): OnboardingResult {
   const root = realpathSync(workspaceRoot);
   const abs = resolve(root, target);
   const rel = relative(root, abs);
@@ -64,11 +69,15 @@ export function cloneRepository(url: string, target: string, workspaceRoot: stri
   mkdirSync(abs, { recursive: true });
 
   try {
-    execFileSync('git', ['clone', '--', url, abs], {
-      timeout: 120_000,
-      stdio: 'pipe',
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-    });
+    if (options?.token) {
+      cloneWithToken({ url, targetPath: abs, token: options.token, timeoutMs: 120_000 });
+    } else {
+      execFileSync('git', ['clone', '--', url, abs], {
+        timeout: 120_000,
+        stdio: 'pipe',
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      });
+    }
   } catch {
     rmSync(abs, { recursive: true, force: true });
     throw new Error('Clone failed');

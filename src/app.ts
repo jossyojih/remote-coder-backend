@@ -17,6 +17,7 @@ import { DeploymentCoordinator, systemdDeploymentStarter, type DeploymentStarter
 import { DEPLOYMENT_STATUSES } from './types.js';
 import { MaintenanceService } from './maintenance.js';
 import { AttachmentStorage, ATTACHMENT_LIMITS } from './attachments.js';
+import { GitHubAppAuth } from './github-app.js';
 
 export interface AppOptions {
   databasePath?: string;
@@ -102,6 +103,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const absoluteRunsRoot = isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot);
   const attachmentsRoot = options.attachmentsRoot ?? process.env.ATTACHMENTS_ROOT ?? resolve(process.cwd(), './data/attachments');
   const attachments = new AttachmentStorage(attachmentsRoot);
+  const githubApp = new GitHubAppAuth();
   const deploymentCoordinator = new DeploymentCoordinator(store, options.backendDeployRepositoryPath ?? process.env.BACKEND_DEPLOY_REPOSITORY_PATH, options.deploymentStarter ?? systemdDeploymentStarter());
   const promotion = new PromotionService(store, workspaceRoot, absoluteRunsRoot, deploymentCoordinator);
   const bus = new JobEventBus();
@@ -189,7 +191,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
 
   app.post('/projects', async (request, reply) => {
     const input = createProjectSchema.parse(request.body);
-    const repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string }> = [];
+    const repositories: Array<{ name: string; path: string; remoteName?: string; targetBranch?: string; normalizedUrl?: string }> = [];
     for (const repository of input.repositories) {
       repositories.push({ ...repository, path: validatedRepositoryPath(repository.path, workspaceRoot) });
     }
@@ -204,7 +206,30 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
         name: repoUrl.name || `${validation.owner}/${validation.repo}`,
         path: result.clonePath,
         targetBranch: result.defaultBranch,
+        normalizedUrl: validation.normalized,
       });
+    }
+    for (const ghRepo of input.githubRepositories ?? []) {
+      if (!githubApp.isConfigured()) return reply.code(503).send({ error: 'GitHub App is not configured' });
+      const normalized = `git@github.com:${ghRepo.owner}/${ghRepo.repo}.git`;
+      const existing = store.findRepositoryByNormalizedUrl(normalized);
+      if (existing) return reply.code(409).send({ error: `Repository ${ghRepo.owner}/${ghRepo.repo} is already onboarded` });
+      try {
+        const hasAccess = await githubApp.verifyRepositoryAccess(ghRepo.owner, ghRepo.repo);
+        if (!hasAccess) return reply.code(403).send({ error: `GitHub App does not have access to ${ghRepo.owner}/${ghRepo.repo}` });
+        const token = await githubApp.getInstallationToken();
+        const dirName = safeDirName(ghRepo.owner, ghRepo.repo);
+        const result = cloneRepository(normalized, dirName, workspaceRoot, { token });
+        repositories.push({
+          name: ghRepo.name || `${ghRepo.owner}/${ghRepo.repo}`,
+          path: result.clonePath,
+          targetBranch: ghRepo.defaultBranch || result.defaultBranch,
+          normalizedUrl: normalized,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Repository onboarding failed';
+        return reply.code(400).send({ error: message });
+      }
     }
     const project = store.createProject(input.name, repositories, input.description, input.promotionPolicy, input.defaultAgent, input.defaultModel);
     return reply.code(201).send(project);
@@ -221,23 +246,55 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const project = store.getProject(id);
     if (!project) return reply.code(404).send({ error: 'Project not found' });
     const input = addRepositorySchema.parse(request.body);
-    const validation = validateRepositoryUrl(input.url);
-    if (!validation.valid) return reply.code(400).send({ error: validation.error });
-    const lockKey = `${id}:${validation.normalized}`;
-    if (onboardingLocks.has(lockKey)) return reply.code(409).send({ error: 'Repository onboarding already in progress' });
-    const existing = store.findRepositoryByNormalizedUrl(validation.normalized, id);
-    if (existing) return reply.code(409).send({ error: `Repository ${validation.owner}/${validation.repo} is already connected to this project` });
     const activeJobs = store.activeJobsForProject(id);
     if (activeJobs.length > 0) return reply.code(409).send({ error: 'Cannot add repositories while jobs are active' });
-    const dirName = safeDirName(validation.owner, validation.repo);
+
+    let normalized: string;
+    let owner: string;
+    let repo: string;
+    let dirName: string;
+    let cloneOptions: { token?: string } | undefined;
+    let targetBranch: string | undefined;
+
+    if (input.url) {
+      const validation = validateRepositoryUrl(input.url);
+      if (!validation.valid) return reply.code(400).send({ error: validation.error });
+      normalized = validation.normalized;
+      owner = validation.owner;
+      repo = validation.repo;
+    } else if (input.owner && input.repo) {
+      if (!githubApp.isConfigured()) return reply.code(503).send({ error: 'GitHub App is not configured' });
+      owner = input.owner;
+      repo = input.repo;
+      normalized = `git@github.com:${owner}/${repo}.git`;
+      try {
+        const hasAccess = await githubApp.verifyRepositoryAccess(owner, repo);
+        if (!hasAccess) return reply.code(403).send({ error: `GitHub App does not have access to ${owner}/${repo}` });
+        const token = await githubApp.getInstallationToken();
+        cloneOptions = { token };
+        targetBranch = input.defaultBranch;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'GitHub App verification failed';
+        return reply.code(400).send({ error: message });
+      }
+    } else {
+      return reply.code(400).send({ error: 'Either url or owner+repo is required' });
+    }
+
+    const lockKey = `${id}:${normalized}`;
+    if (onboardingLocks.has(lockKey)) return reply.code(409).send({ error: 'Repository onboarding already in progress' });
+    const existing = store.findRepositoryByNormalizedUrl(normalized, id);
+    if (existing) return reply.code(409).send({ error: `Repository ${owner}/${repo} is already connected to this project` });
+
+    dirName = safeDirName(owner, repo);
     let onboardPromise: Promise<unknown>;
     try {
       onboardPromise = Promise.resolve();
       onboardingLocks.set(lockKey, onboardPromise);
-      const result = cloneRepository(validation.normalized, dirName, workspaceRoot);
-      const name = input.name || `${validation.owner}/${validation.repo}`;
-      const repo = store.addRepository(id, name, result.clonePath, 'origin', result.defaultBranch, validation.normalized);
-      return reply.code(201).send(repo);
+      const result = cloneRepository(normalized, dirName, workspaceRoot, cloneOptions);
+      const name = input.name || `${owner}/${repo}`;
+      const repoRecord = store.addRepository(id, name, result.clonePath, 'origin', targetBranch || result.defaultBranch, normalized);
+      return reply.code(201).send(repoRecord);
     } catch (error) {
       cleanupFailedClone(dirName, workspaceRoot);
       const message = error instanceof Error ? error.message : 'Repository onboarding failed';
@@ -247,6 +304,35 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     }
   });
   app.get('/capabilities', async () => capabilities);
+  app.get('/github/status', async () => ({ configured: githubApp.isConfigured() }));
+  app.get('/github/repositories', async (request, reply) => {
+    if (!githubApp.isConfigured()) return reply.code(503).send({ error: 'GitHub App is not configured' });
+    const query = request.query as { page?: string; perPage?: string; search?: string; projectId?: string };
+    try {
+      const page = query.page ? Math.max(1, parseInt(query.page, 10)) : 1;
+      const perPage = query.perPage ? Math.min(100, Math.max(1, parseInt(query.perPage, 10))) : 30;
+      const { repositories, totalCount } = await githubApp.listRepositories({ page, perPage, search: query.search });
+      const connectedUrls = query.projectId ? new Set(store.getProject(query.projectId)?.repositories.map((r) => r.normalizedUrl) ?? []) : new Set();
+      const items = repositories.map((repo) => {
+        const normalized = `git@github.com:${repo.owner.login}/${repo.name}.git`;
+        return {
+          id: repo.id,
+          fullName: repo.full_name,
+          owner: repo.owner.login,
+          name: repo.name,
+          private: repo.private,
+          defaultBranch: repo.default_branch,
+          alreadyConnected: connectedUrls.has(normalized),
+        };
+      });
+      return { repositories: items, totalCount, page, perPage };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'GitHub API request failed';
+      if (message.includes('rate limit')) return reply.code(429).send({ error: 'GitHub API rate limit exceeded' });
+      if (message.includes('authentication')) return reply.code(401).send({ error: 'GitHub App authentication failed' });
+      return reply.code(502).send({ error: 'GitHub API unavailable' });
+    }
+  });
   app.get('/projects/:id', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params); const project = store.getProject(id);
     return project ?? reply.code(404).send({ error: 'Project not found' });
