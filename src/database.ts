@@ -76,6 +76,7 @@ export class Store {
     if (!repositoryColumns.some((column) => column.name === 'target_branch')) this.db.exec('ALTER TABLE repositories ADD COLUMN target_branch TEXT');
     if (!repositoryColumns.some((column) => column.name === 'promotion_policy_override')) this.db.exec("ALTER TABLE repositories ADD COLUMN promotion_policy_override TEXT CHECK(promotion_policy_override IN ('review_required','auto_push','read_only'))");
     if (!repositoryColumns.some((column) => column.name === 'normalized_url')) this.db.exec('ALTER TABLE repositories ADD COLUMN normalized_url TEXT');
+    if (!repositoryColumns.some((column) => column.name === 'disconnected_at')) this.db.exec('ALTER TABLE repositories ADD COLUMN disconnected_at TEXT');
     const projectColumns = this.db.prepare('PRAGMA table_info(projects)').all() as unknown as Array<{ name: string }>;
     if (!projectColumns.some((column) => column.name === 'promotion_policy')) this.db.exec("ALTER TABLE projects ADD COLUMN promotion_policy TEXT NOT NULL DEFAULT 'review_required' CHECK(promotion_policy IN ('review_required','auto_push','read_only'))");
     if (!projectColumns.some((column) => column.name === 'description')) this.db.exec('ALTER TABLE projects ADD COLUMN description TEXT');
@@ -319,8 +320,8 @@ export class Store {
 
   findRepositoryByNormalizedUrl(normalizedUrl: string, projectId?: string): { id: string; projectId: string } | undefined {
     const query = projectId
-      ? 'SELECT id, project_id FROM repositories WHERE normalized_url=? AND project_id=? LIMIT 1'
-      : 'SELECT id, project_id FROM repositories WHERE normalized_url=? LIMIT 1';
+      ? 'SELECT id, project_id FROM repositories WHERE normalized_url=? AND project_id=? AND disconnected_at IS NULL LIMIT 1'
+      : 'SELECT id, project_id FROM repositories WHERE normalized_url=? AND disconnected_at IS NULL LIMIT 1';
     const row = projectId
       ? this.db.prepare(query).get(normalizedUrl, projectId) as { id: string; project_id: string } | undefined
       : this.db.prepare(query).get(normalizedUrl) as { id: string; project_id: string } | undefined;
@@ -338,6 +339,42 @@ export class Store {
     return this.db.prepare("SELECT id FROM jobs WHERE project_id=? AND status IN ('queued','running','needs_input') AND archived_at IS NULL LIMIT 1").all(projectId) as Array<{ id: string }>;
   }
 
+  activeJobsForRepository(repositoryId: string): Array<{ id: string; status: string }> {
+    return this.db.prepare(`
+      SELECT DISTINCT j.id, j.status FROM jobs j
+      LEFT JOIN job_repositories jr ON jr.job_id = j.id AND jr.repository_id = ?
+      LEFT JOIN job_requested_repositories jrr ON jrr.job_id = j.id AND jrr.repository_id = ?
+      WHERE (jr.repository_id IS NOT NULL OR jrr.repository_id IS NOT NULL)
+        AND j.status IN ('queued','running','needs_input') AND j.archived_at IS NULL
+    `).all(repositoryId, repositoryId) as Array<{ id: string; status: string }>;
+  }
+
+  pendingPromotionsForRepository(repositoryId: string): Array<{ id: string }> {
+    return this.db.prepare(`
+      SELECT p.id FROM promotions p
+      JOIN promotion_repositories pr ON pr.promotion_id = p.id
+      WHERE pr.repository_id = ? AND p.status IN ('pending','promoting')
+    `).all(repositoryId) as Array<{ id: string }>;
+  }
+
+  activeDeploymentsForRepository(repositoryId: string): Array<{ id: string }> {
+    return this.db.prepare(`
+      SELECT id FROM deployments
+      WHERE repository_id = ? AND status IN ('queued','deploying')
+    `).all(repositoryId) as Array<{ id: string }>;
+  }
+
+  getRepository(repositoryId: string): { id: string; projectId: string; name: string; path: string; normalizedUrl: string | null; createdAt: string; disconnectedAt: string | null } | undefined {
+    const row = this.db.prepare('SELECT id, project_id, name, path, normalized_url, created_at, disconnected_at FROM repositories WHERE id=?').get(repositoryId) as { id: string; project_id: string; name: string; path: string; normalized_url: string | null; created_at: string; disconnected_at: string | null } | undefined;
+    return row ? { id: row.id, projectId: row.project_id, name: row.name, path: row.path, normalizedUrl: row.normalized_url, createdAt: row.created_at, disconnectedAt: row.disconnected_at } : undefined;
+  }
+
+  disconnectRepository(repositoryId: string): boolean {
+    const now = new Date().toISOString();
+    const result = this.db.prepare('UPDATE repositories SET disconnected_at=? WHERE id=? AND disconnected_at IS NULL').run(now, repositoryId);
+    return Number(result.changes) > 0;
+  }
+
   listProjects(extractUrlCallback?: (path: string) => string | null): Project[] {
     const rows = this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as unknown as ProjectRow[];
     return rows.map((row) => this.mapProject(row, extractUrlCallback));
@@ -349,7 +386,7 @@ export class Store {
   }
 
   private mapProject(row: ProjectRow, extractUrlCallback?: (path: string) => string | null): Project {
-    const repos = this.db.prepare('SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, name').all(row.id) as unknown as RepoRow[];
+    const repos = this.db.prepare('SELECT * FROM repositories WHERE project_id = ? AND disconnected_at IS NULL ORDER BY created_at, name').all(row.id) as unknown as RepoRow[];
     return { id: row.id, name: row.name, description: row.description ?? undefined, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', defaultAgent: row.default_agent ?? undefined, defaultModel: row.default_model ?? undefined, defaultReasoningLevel: row.default_reasoning_level ?? undefined, repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required', extractUrlCallback)) };
   }
 
@@ -390,7 +427,7 @@ export class Store {
   repositoriesBelongTo(projectId: string, ids: string[]): boolean {
     const placeholders = ids.map(() => '?').join(',');
     if (!placeholders) return false;
-    const row = this.db.prepare(`SELECT COUNT(*) count FROM repositories WHERE project_id = ? AND id IN (${placeholders})`).get(projectId, ...ids) as { count: number };
+    const row = this.db.prepare(`SELECT COUNT(*) count FROM repositories WHERE project_id = ? AND disconnected_at IS NULL AND id IN (${placeholders})`).get(projectId, ...ids) as { count: number };
     return Number(row.count) === ids.length;
   }
 

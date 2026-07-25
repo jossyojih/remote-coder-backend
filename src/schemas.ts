@@ -38,6 +38,7 @@ export const updateProjectSchema = z.object({
 });
 
 export const addRepositorySchema = z.object({
+  mode: z.enum(['url', 'github']).optional(),
   url: z.string().trim().min(1).max(2048).optional(),
   name: z.string().trim().min(1).max(200).optional(),
   owner: z.string().trim().min(1).max(100).optional(),
@@ -46,8 +47,20 @@ export const addRepositorySchema = z.object({
 }).superRefine((value, context) => {
   const hasUrl = !!value.url;
   const hasGitHub = !!(value.owner && value.repo);
-  if (!hasUrl && !hasGitHub) context.addIssue({ code: 'custom', path: ['url'], message: 'Either url or owner+repo is required' });
-  if (hasUrl && hasGitHub) context.addIssue({ code: 'custom', path: ['url'], message: 'Cannot specify both url and owner+repo' });
+  if (value.mode === 'url') {
+    if (!hasUrl) context.addIssue({ code: 'custom', path: ['url'], message: 'URL is required in url mode' });
+    if (hasGitHub) context.addIssue({ code: 'custom', path: ['owner'], message: 'Cannot specify owner+repo in url mode' });
+  } else if (value.mode === 'github') {
+    if (!hasGitHub) context.addIssue({ code: 'custom', path: ['owner'], message: 'owner and repo are required in github mode' });
+    if (hasUrl) context.addIssue({ code: 'custom', path: ['url'], message: 'Cannot specify url in github mode' });
+  } else {
+    if (!hasUrl && !hasGitHub) context.addIssue({ code: 'custom', path: ['url'], message: 'Either url or owner+repo is required' });
+    if (hasUrl && hasGitHub) context.addIssue({ code: 'custom', path: ['url'], message: 'Cannot specify both url and owner+repo' });
+  }
+});
+
+export const disconnectRepositorySchema = z.object({
+  confirmName: z.string().trim().min(1).max(500),
 });
 
 export const attachmentMetadataSchema = z.object({

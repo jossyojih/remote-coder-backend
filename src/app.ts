@@ -7,7 +7,7 @@ import { ZodError } from 'zod';
 import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
-import { addRepositorySchema, createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, threadSearchSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateProjectSchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
+import { addRepositorySchema, createJobSchema, createProjectSchema, disconnectRepositorySchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, threadSearchSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateProjectSchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
 import { cloneRepository, cleanupFailedClone, extractGitHubUrlFromOrigin, parseGitHubUrl, safeDirName, validateRepositoryUrl } from './repository-onboarding.js';
 import { buildCapabilities, validateSelection } from './capabilities.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
@@ -303,6 +303,67 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     } finally {
       onboardingLocks.delete(lockKey);
     }
+  });
+  app.delete('/projects/:id/repositories/:repositoryId', async (request, reply) => {
+    const { id, repositoryId } = projectRepositoryParamsSchema.parse(request.params);
+    const input = disconnectRepositorySchema.parse(request.body);
+    const project = store.getProject(id);
+    if (!project) return reply.code(404).send({ error: 'Project not found' });
+    const repo = store.getRepository(repositoryId);
+    if (!repo || repo.projectId !== id || repo.disconnectedAt) return reply.code(404).send({ error: 'Repository not found in this project' });
+    const expectedName = repo.normalizedUrl
+      ? repo.normalizedUrl.replace(/^.*github\.com[:/]/, '').replace(/\.git$/, '')
+      : repo.name;
+    if (input.confirmName !== expectedName) return reply.code(400).send({ error: 'Confirmation name does not match repository' });
+    const activeJobs = store.activeJobsForRepository(repositoryId);
+    if (activeJobs.length > 0) return reply.code(409).send({ error: 'Cannot disconnect: repository has active jobs', code: 'active_jobs' });
+    const pendingPromotions = store.pendingPromotionsForRepository(repositoryId);
+    if (pendingPromotions.length > 0) return reply.code(409).send({ error: 'Cannot disconnect: repository has pending promotions', code: 'pending_promotions' });
+    const activeDeployments = store.activeDeploymentsForRepository(repositoryId);
+    if (activeDeployments.length > 0) return reply.code(409).send({ error: 'Cannot disconnect: repository has active deployments', code: 'active_deployments' });
+    const isManaged = !!repo.normalizedUrl;
+    let cloneRemoved = false;
+    if (isManaged) {
+      try {
+        const { realpathSync, existsSync, lstatSync, rmSync } = await import('node:fs');
+        const { execFileSync } = await import('node:child_process');
+        const { relative, isAbsolute } = await import('node:path');
+        const root = realpathSync(workspaceRoot);
+        if (existsSync(repo.path)) {
+          const stat = lstatSync(repo.path);
+          if (stat.isSymbolicLink()) {
+            return reply.code(400).send({ error: 'Repository path is a symlink' });
+          }
+        }
+        const realPath = existsSync(repo.path) ? realpathSync(repo.path) : repo.path;
+        const rel = relative(root, realPath);
+        if (rel.startsWith('..') || isAbsolute(rel)) {
+          return reply.code(400).send({ error: 'Repository path is outside workspace root' });
+        }
+        let hasWorktrees = false;
+        if (existsSync(realPath)) {
+          try {
+            const worktreeList = execFileSync('git', ['-C', realPath, 'worktree', 'list', '--porcelain'], { timeout: 10_000, stdio: 'pipe', encoding: 'utf-8' });
+            const worktreeLines = worktreeList.split('\n').filter((line) => line.startsWith('worktree '));
+            hasWorktrees = worktreeLines.length > 1;
+          } catch { /* no worktrees or not a git repo */ }
+        }
+        if (hasWorktrees) {
+          return reply.code(409).send({ error: 'Cannot remove clone: repository has active worktrees', code: 'active_worktrees' });
+        }
+        store.disconnectRepository(repositoryId);
+        if (existsSync(realPath)) {
+          rmSync(realPath, { recursive: true, force: true });
+        }
+        cloneRemoved = true;
+      } catch (error) {
+        if ((error as { statusCode?: number }).statusCode) throw error;
+        store.disconnectRepository(repositoryId);
+      }
+    } else {
+      store.disconnectRepository(repositoryId);
+    }
+    return { disconnected: true, repositoryId, cloneRemoved };
   });
   app.get('/capabilities', async () => capabilities);
   app.get('/github/status', async () => ({ configured: githubApp.isConfigured() }));
