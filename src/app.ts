@@ -8,7 +8,7 @@ import { Store } from './database.js';
 import { CodexAgentAdapter } from './codex-adapter.js';
 import { ClaudeAgentAdapter } from './claude-adapter.js';
 import { addRepositorySchema, createJobSchema, createProjectSchema, followUpSchema, idParamsSchema, projectRepositoryParamsSchema, promoteJobSchema, replySchema, scopeDecisionSchema, threadSearchSchema, updateProjectAgentDefaultsSchema, updateProjectPromotionPolicySchema, updateProjectSchema, updateRepositoryPromotionPolicySchema } from './schemas.js';
-import { cloneRepository, cleanupFailedClone, parseGitHubUrl, safeDirName, validateRepositoryUrl } from './repository-onboarding.js';
+import { cloneRepository, cleanupFailedClone, extractGitHubUrlFromOrigin, parseGitHubUrl, safeDirName, validateRepositoryUrl } from './repository-onboarding.js';
 import { buildCapabilities, validateSelection } from './capabilities.js';
 import { JobEventBus, JobWorker, MockAgentAdapter } from './worker.js';
 import { issueAccessToken, LoginRateLimiter, verifyAccessToken, verifyPassword } from './auth.js';
@@ -240,7 +240,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     const project = store.updateProject(id, input);
     return project ?? reply.code(404).send({ error: 'Project not found' });
   });
-  app.get('/projects', async () => store.listProjects());
+  app.get('/projects', async () => store.listProjects(extractGitHubUrlFromOrigin));
   app.post('/projects/:id/repositories', async (request, reply) => {
     const { id } = idParamsSchema.parse(request.params);
     const project = store.getProject(id);
@@ -281,9 +281,10 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       return reply.code(400).send({ error: 'Either url or owner+repo is required' });
     }
 
-    const lockKey = `${id}:${normalized}`;
+    const githubUrl = `https://github.com/${owner}/${repo}`;
+    const lockKey = `${id}:${githubUrl}`;
     if (onboardingLocks.has(lockKey)) return reply.code(409).send({ error: 'Repository onboarding already in progress' });
-    const existing = store.findRepositoryByNormalizedUrl(normalized, id);
+    const existing = store.findRepositoryByNormalizedUrl(githubUrl, id);
     if (existing) return reply.code(409).send({ error: `Repository ${owner}/${repo} is already connected to this project` });
 
     dirName = safeDirName(owner, repo);
@@ -293,7 +294,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       onboardingLocks.set(lockKey, onboardPromise);
       const result = cloneRepository(normalized, dirName, workspaceRoot, cloneOptions);
       const name = input.name || `${owner}/${repo}`;
-      const repoRecord = store.addRepository(id, name, result.clonePath, 'origin', targetBranch || result.defaultBranch, normalized);
+      const repoRecord = store.addRepository(id, name, result.clonePath, 'origin', targetBranch || result.defaultBranch, githubUrl);
       return reply.code(201).send(repoRecord);
     } catch (error) {
       cleanupFailedClone(dirName, workspaceRoot);
@@ -314,7 +315,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       const { repositories, totalCount } = await githubApp.listRepositories({ page, perPage, search: query.search });
       const connectedUrls = query.projectId ? new Set(store.getProject(query.projectId)?.repositories.map((r) => r.normalizedUrl) ?? []) : new Set();
       const items = repositories.map((repo) => {
-        const normalized = `git@github.com:${repo.owner.login}/${repo.name}.git`;
+        const githubUrl = `https://github.com/${repo.owner.login}/${repo.name}`;
         return {
           id: repo.id,
           fullName: repo.full_name,
@@ -322,7 +323,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
           name: repo.name,
           private: repo.private,
           defaultBranch: repo.default_branch,
-          alreadyConnected: connectedUrls.has(normalized),
+          alreadyConnected: connectedUrls.has(githubUrl),
         };
       });
       return { repositories: items, totalCount, page, perPage };
@@ -334,7 +335,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     }
   });
   app.get('/projects/:id', async (request, reply) => {
-    const { id } = idParamsSchema.parse(request.params); const project = store.getProject(id);
+    const { id } = idParamsSchema.parse(request.params); const project = store.getProject(id, extractGitHubUrlFromOrigin);
     return project ?? reply.code(404).send({ error: 'Project not found' });
   });
   app.get('/projects/:id/promotion-policy', async (request, reply) => {

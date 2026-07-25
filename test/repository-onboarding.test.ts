@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
-import { cloneRepository, cleanupFailedClone, parseGitHubUrl, safeDirName, validateRepositoryUrl } from '../src/repository-onboarding.js';
+import { cloneRepository, cleanupFailedClone, extractGitHubUrlFromOrigin, parseGitHubUrl, safeDirName, validateRepositoryUrl } from '../src/repository-onboarding.js';
 
 const apps: FastifyInstance[] = [];
 const token = 'test-token';
@@ -270,7 +270,7 @@ test('POST /projects/:id/repositories detects duplicate repository URLs', async 
     payload: { name: 'P', repositories: [{ name: 'R', path: join(root, 'existing-repo') }] },
   });
   const projectId = createResponse.json().id;
-  store.addRepository(projectId, 'Existing', dupeDir, 'origin', 'main', 'git@github.com:owner/repo.git');
+  store.addRepository(projectId, 'Existing', dupeDir, 'origin', 'main', 'https://github.com/owner/repo');
   const response = await app.inject({
     method: 'POST', url: `/projects/${projectId}/repositories`, headers: auth,
     payload: { url: 'https://github.com/owner/repo' },
@@ -355,7 +355,7 @@ test('idempotent duplicate POST /projects returns 409', async () => {
     payload: { name: 'P', repositories: [{ name: 'R', path: join(root, 'existing-repo') }] },
   });
   const projectId = createResponse.json().id;
-  store.addRepository(projectId, 'X', idemDir, 'origin', 'main', 'git@github.com:dupe/repo.git');
+  store.addRepository(projectId, 'X', idemDir, 'origin', 'main', 'https://github.com/dupe/repo');
   const r1 = await app.inject({
     method: 'POST', url: `/projects/${projectId}/repositories`, headers: auth,
     payload: { url: 'https://github.com/dupe/repo' },
@@ -395,4 +395,92 @@ test('errors do not expose filesystem paths', async () => {
   assert.ok(!body.includes(root));
   assert.ok(!body.includes('/tmp'));
   assert.ok(!body.includes('/home'));
+});
+
+test('extractGitHubUrlFromOrigin extracts HTTPS URL from HTTPS origin', () => {
+  const root = mkdtempSync(join(tmpdir(), 'extract-https-'));
+  const remote = createFakeGitRemote(root, 'test-repo');
+  const result = cloneRepository(remote, 'cloned', root);
+  // Change origin to HTTPS
+  execFileSync('git', ['-C', result.clonePath, 'remote', 'set-url', 'origin', 'https://github.com/owner/repo.git'], { stdio: 'pipe' });
+  const extracted = extractGitHubUrlFromOrigin(result.clonePath);
+  assert.equal(extracted, 'https://github.com/owner/repo');
+});
+
+test('extractGitHubUrlFromOrigin extracts HTTPS URL from SSH origin', () => {
+  const root = mkdtempSync(join(tmpdir(), 'extract-ssh-'));
+  const remote = createFakeGitRemote(root, 'test-repo');
+  const result = cloneRepository(remote, 'cloned', root);
+  // Change origin to SSH
+  execFileSync('git', ['-C', result.clonePath, 'remote', 'set-url', 'origin', 'git@github.com:owner/repo.git'], { stdio: 'pipe' });
+  const extracted = extractGitHubUrlFromOrigin(result.clonePath);
+  assert.equal(extracted, 'https://github.com/owner/repo');
+});
+
+test('extractGitHubUrlFromOrigin strips credentials from URL', () => {
+  const root = mkdtempSync(join(tmpdir(), 'extract-creds-'));
+  const remote = createFakeGitRemote(root, 'test-repo');
+  const result = cloneRepository(remote, 'cloned', root);
+  execFileSync('git', ['-C', result.clonePath, 'remote', 'set-url', 'origin', 'https://token:x-oauth-basic@github.com/owner/repo.git'], { stdio: 'pipe' });
+  const extracted = extractGitHubUrlFromOrigin(result.clonePath);
+  assert.equal(extracted, 'https://github.com/owner/repo');
+});
+
+test('extractGitHubUrlFromOrigin returns null for non-GitHub origins', () => {
+  const root = mkdtempSync(join(tmpdir(), 'extract-non-github-'));
+  const remote = createFakeGitRemote(root, 'test-repo');
+  const result = cloneRepository(remote, 'cloned', root);
+  execFileSync('git', ['-C', result.clonePath, 'remote', 'set-url', 'origin', 'https://gitlab.com/owner/repo.git'], { stdio: 'pipe' });
+  const extracted = extractGitHubUrlFromOrigin(result.clonePath);
+  assert.equal(extracted, null);
+});
+
+test('extractGitHubUrlFromOrigin returns null for missing origin', () => {
+  const root = mkdtempSync(join(tmpdir(), 'extract-no-origin-'));
+  const remote = createFakeGitRemote(root, 'test-repo');
+  const result = cloneRepository(remote, 'cloned', root);
+  execFileSync('git', ['-C', result.clonePath, 'remote', 'remove', 'origin'], { stdio: 'pipe' });
+  const extracted = extractGitHubUrlFromOrigin(result.clonePath);
+  assert.equal(extracted, null);
+});
+
+test('GET /projects/:id returns repository URLs', async () => {
+  const { app, root, store } = await fixture();
+  const remote = createFakeGitRemote(root, 'url-test-repo');
+  const createResponse = await app.inject({
+    method: 'POST', url: '/projects', headers: auth,
+    payload: { name: 'URL Test', repositories: [{ name: 'R', path: join(root, 'existing-repo') }] },
+  });
+  const projectId = createResponse.json().id;
+
+  // Add a repository with normalizedUrl
+  const cloneResult = cloneRepository(remote, 'url-repo', root);
+  execFileSync('git', ['-C', cloneResult.clonePath, 'remote', 'set-url', 'origin', 'https://github.com/test/repo.git'], { stdio: 'pipe' });
+  store.addRepository(projectId, 'Test Repo', cloneResult.clonePath, 'origin', 'main', 'https://github.com/test/repo');
+
+  const response = await app.inject({
+    method: 'GET', url: `/projects/${projectId}`, headers: auth,
+  });
+
+  assert.equal(response.statusCode, 200);
+  const body = response.json();
+  const repoWithUrl = body.repositories.find((r: { name: string }) => r.name === 'Test Repo');
+  assert.ok(repoWithUrl);
+  assert.equal(repoWithUrl.url, 'https://github.com/test/repo');
+});
+
+test('POST /projects/:id/repositories stores HTTPS URL', async () => {
+  const { app, root } = await fixture();
+  const remote = createFakeGitRemote(root, 'post-url-repo');
+  const createResponse = await app.inject({
+    method: 'POST', url: '/projects', headers: auth,
+    payload: { name: 'P', repositories: [{ name: 'R', path: join(root, 'existing-repo') }] },
+  });
+  const projectId = createResponse.json().id;
+  const response = await app.inject({
+    method: 'POST', url: `/projects/${projectId}/repositories`, headers: auth,
+    payload: { url: remote, name: 'New Repo' },
+  });
+  // Should fail because remote is not a github.com URL
+  assert.equal(response.statusCode, 400);
 });

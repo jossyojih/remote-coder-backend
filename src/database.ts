@@ -338,24 +338,38 @@ export class Store {
     return this.db.prepare("SELECT id FROM jobs WHERE project_id=? AND status IN ('queued','running','needs_input') AND archived_at IS NULL LIMIT 1").all(projectId) as Array<{ id: string }>;
   }
 
-  listProjects(): Project[] {
+  listProjects(extractUrlCallback?: (path: string) => string | null): Project[] {
     const rows = this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as unknown as ProjectRow[];
-    return rows.map((row) => this.mapProject(row));
+    return rows.map((row) => this.mapProject(row, extractUrlCallback));
   }
 
-  getProject(id: string): Project | undefined {
+  getProject(id: string, extractUrlCallback?: (path: string) => string | null): Project | undefined {
     const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as unknown as ProjectRow | undefined;
-    return row ? this.mapProject(row) : undefined;
+    return row ? this.mapProject(row, extractUrlCallback) : undefined;
   }
 
-  private mapProject(row: ProjectRow): Project {
+  private mapProject(row: ProjectRow, extractUrlCallback?: (path: string) => string | null): Project {
     const repos = this.db.prepare('SELECT * FROM repositories WHERE project_id = ? ORDER BY created_at, name').all(row.id) as unknown as RepoRow[];
-    return { id: row.id, name: row.name, description: row.description ?? undefined, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', defaultAgent: row.default_agent ?? undefined, defaultModel: row.default_model ?? undefined, defaultReasoningLevel: row.default_reasoning_level ?? undefined, repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required')) };
+    return { id: row.id, name: row.name, description: row.description ?? undefined, createdAt: row.created_at, promotionPolicy: row.promotion_policy ?? 'review_required', defaultAgent: row.default_agent ?? undefined, defaultModel: row.default_model ?? undefined, defaultReasoningLevel: row.default_reasoning_level ?? undefined, repositories: repos.map((repo) => this.mapRepo(repo, row.promotion_policy ?? 'review_required', extractUrlCallback)) };
   }
 
-  private mapRepo = (row: RepoRow, projectPolicy?: PromotionPolicy): Repository => {
+  private mapRepo = (row: RepoRow, projectPolicy?: PromotionPolicy, extractUrlCallback?: (path: string) => string | null): Repository & { url?: string } => {
     const fallback = projectPolicy ?? (this.db.prepare('SELECT promotion_policy FROM projects WHERE id=?').get(row.project_id) as { promotion_policy: PromotionPolicy } | undefined)?.promotion_policy ?? 'review_required';
-    return { id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at, remoteName: row.remote_name ?? 'origin', targetBranch: row.target_branch ?? undefined, normalizedUrl: row.normalized_url ?? undefined, promotionPolicyOverride: row.promotion_policy_override ?? undefined, effectivePromotionPolicy: row.promotion_policy_override ?? fallback };
+
+    // Use stored normalizedUrl if available
+    let repositoryUrl: string | undefined = row.normalized_url ?? undefined;
+
+    // For legacy repositories without stored URL, try to extract and persist it
+    if (!repositoryUrl && extractUrlCallback) {
+      const extracted = extractUrlCallback(row.path);
+      if (extracted) {
+        repositoryUrl = extracted;
+        // Persist the extracted URL
+        this.updateRepositoryNormalizedUrl(row.id, extracted);
+      }
+    }
+
+    return { id: row.id, projectId: row.project_id, name: row.name, path: row.path, createdAt: row.created_at, remoteName: row.remote_name ?? 'origin', targetBranch: row.target_branch ?? undefined, normalizedUrl: repositoryUrl, url: repositoryUrl, promotionPolicyOverride: row.promotion_policy_override ?? undefined, effectivePromotionPolicy: row.promotion_policy_override ?? fallback };
   };
 
   updateProjectPromotionPolicy(id: string, policy: PromotionPolicy): Project | undefined {
@@ -386,6 +400,10 @@ export class Store {
     const rows = this.db.prepare(`SELECT * FROM repositories WHERE id IN (${placeholders})`).all(...ids) as unknown as RepoRow[];
     const byId = new Map(rows.map((row) => [row.id, this.mapRepo(row)]));
     return ids.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
+  }
+
+  updateRepositoryNormalizedUrl(repositoryId: string, normalizedUrl: string): void {
+    this.db.prepare('UPDATE repositories SET normalized_url = ? WHERE id = ?').run(normalizedUrl, repositoryId);
   }
 
   createJob(projectId: string, prompt: string, repositoryIds: string[], requestedSelection: AgentSelection | AgentSelection['agent'], scopeMode: ScopeMode): Job {

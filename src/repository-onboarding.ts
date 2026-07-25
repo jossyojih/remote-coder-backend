@@ -31,6 +31,30 @@ export function parseGitHubUrl(url: string): { owner: string; repo: string; norm
   return null;
 }
 
+export function extractGitHubUrlFromOrigin(repoPath: string): string | null {
+  try {
+    const originUrl = execFileSync('git', ['-C', repoPath, 'config', '--get', 'remote.origin.url'], {
+      timeout: 5000,
+      stdio: 'pipe',
+      encoding: 'utf-8',
+    }).trim();
+
+    if (!originUrl) return null;
+
+    // Strip credentials, query strings, fragments
+    let cleaned = originUrl.replace(/^(https?:\/\/)[^@]*@/, '$1');
+    cleaned = cleaned.replace(/\?.*$/, '').replace(/#.*$/, '');
+
+    const parsed = parseGitHubUrl(cleaned);
+    if (!parsed) return null;
+
+    // Return normalized HTTPS URL
+    return `https://github.com/${parsed.owner}/${parsed.repo}`;
+  } catch {
+    return null;
+  }
+}
+
 export function validateRepositoryUrl(url: string): { valid: true; owner: string; repo: string; normalized: string } | { valid: false; error: string } {
   const trimmed = url.trim();
   if (!trimmed) return { valid: false, error: 'Repository URL is required' };
