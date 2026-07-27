@@ -8,6 +8,15 @@ type RepoRow = { id: string; project_id: string; name: string; path: string; rem
 type JobRow = { id: string; project_id: string; prompt: string; agent: AgentSelection['agent']; model: string | null; reasoning_level: AgentSelection['reasoningLevel'] | null; status: JobStatus; scope_mode: ScopeMode; scope_state: string; scope_reasons: string; proposed_repository_ids: string; parent_job_id: string | null; thread_id: string | null; conversation_context: string | null; follow_up_request_id: string | null; created_at: string; updated_at: string; archived_at: string | null; purge_after: string | null };
 type EventRow = { id: number; job_id: string; type: string; message: string; data: string; created_at: string };
 
+export class EnvironmentVariableMigrationConflictError extends Error {
+  constructor(readonly conflicts: Array<{ projectId: string; repositoryId: string | null; key: string; environments: string[] }>) {
+    const scopes = conflicts.map(({ projectId, repositoryId, key, environments }) =>
+      `${repositoryId ? `repository ${repositoryId}` : `project ${projectId}`} key ${key} (${environments.join(', ')})`);
+    super(`Environment variable migration requires explicit conflict resolution: ${scopes.join('; ')}`);
+    this.name = 'EnvironmentVariableMigrationConflictError';
+  }
+}
+
 function objectData(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -193,6 +202,29 @@ export class Store {
         action TEXT NOT NULL CHECK(action IN ('create','replace','delete')),
         classification TEXT NOT NULL, allow_agent_access INTEGER NOT NULL, created_at TEXT NOT NULL
       );
+    `);
+    const environmentConflicts = this.db.prepare(`
+      SELECT project_id, repository_id, name, GROUP_CONCAT(environment, ',') environments
+      FROM environment_variables
+      GROUP BY project_id, repository_id, name
+      HAVING COUNT(*) > 1
+      ORDER BY project_id, repository_id, name
+    `).all() as unknown as Array<{ project_id: string; repository_id: string | null; name: string; environments: string }>;
+    if (environmentConflicts.length) {
+      throw new EnvironmentVariableMigrationConflictError(environmentConflicts.map((conflict) => ({
+        projectId: conflict.project_id,
+        repositoryId: conflict.repository_id,
+        key: conflict.name,
+        environments: conflict.environments.split(',').sort(),
+      })));
+    }
+    // The legacy environment column remains solely as authenticated-encryption context for existing ciphertext.
+    // These indexes make scope/key the shared-set identity while preserving every stored value byte-for-byte.
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS environment_variables_shared_project_unique
+        ON environment_variables(project_id,name) WHERE repository_id IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS environment_variables_shared_repository_unique
+        ON environment_variables(project_id,repository_id,name) WHERE repository_id IS NOT NULL;
     `);
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());

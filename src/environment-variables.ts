@@ -2,8 +2,6 @@ import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:
 import { lstatSync, readFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 
-export const ENVIRONMENTS = ['development', 'test', 'production'] as const;
-export type EnvironmentName = typeof ENVIRONMENTS[number];
 export type VariableClassification = 'secret' | 'public';
 export const ENV_LIMITS = { maxVariablesPerScope: 200, maxValueBytes: 32_768, maxImportBytes: 256_000, maxImportVariables: 200 };
 
@@ -24,7 +22,6 @@ const RESERVED_PATTERNS = [
 export interface EnvironmentVariableMetadata {
   id: string;
   key: string;
-  environment: EnvironmentName;
   scope: 'project' | 'repository';
   projectId: string;
   repositoryId?: string;
@@ -37,7 +34,7 @@ export interface EnvironmentVariableMetadata {
   updatedAt: string;
 }
 type Row = {
-  id: string; project_id: string; repository_id: string | null; environment: EnvironmentName; name: string;
+  id: string; project_id: string; repository_id: string | null; environment: string; name: string;
   ciphertext: Buffer; iv: Buffer; auth_tag: Buffer; key_version: number; classification: VariableClassification;
   allow_agent_access: number; created_at: string; updated_at: string;
 };
@@ -70,12 +67,12 @@ function aad(projectId: string, repositoryId: string | null, environment: string
   return Buffer.from(JSON.stringify([projectId, repositoryId, environment, name, version]));
 }
 
-export function encryptValue(key: Buffer, value: string, context: { projectId: string; repositoryId?: string; environment: EnvironmentName; name: string; keyVersion?: number }) {
+export function encryptValue(key: Buffer, value: string, context: { projectId: string; repositoryId?: string; environment?: string; name: string; keyVersion?: number }) {
   if (Buffer.byteLength(value) > ENV_LIMITS.maxValueBytes) throw new EnvironmentValidationError('Environment variable value is too large');
   const keyVersion = context.keyVersion ?? 1;
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(aad(context.projectId, context.repositoryId ?? null, context.environment, context.name, keyVersion));
+  cipher.setAAD(aad(context.projectId, context.repositoryId ?? null, context.environment ?? 'development', context.name, keyVersion));
   const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
   return { ciphertext, iv, authTag: cipher.getAuthTag(), keyVersion };
 }
@@ -138,29 +135,29 @@ export class EnvironmentVariableService {
     if (!keys.has(activeKeyVersion)) throw new EnvironmentConfigurationError('Active environment encryption key is unavailable');
   }
 
-  private rows(projectId: string, repositoryId: string | undefined, environment: EnvironmentName): Row[] {
-    return this.db.prepare(`SELECT * FROM environment_variables WHERE project_id=? AND environment=? AND
-      ${repositoryId ? 'repository_id=?' : 'repository_id IS NULL'} ORDER BY name`).all(...(repositoryId ? [projectId, environment, repositoryId] : [projectId, environment])) as unknown as Row[];
+  private rows(projectId: string, repositoryId?: string): Row[] {
+    return this.db.prepare(`SELECT * FROM environment_variables WHERE project_id=? AND
+      ${repositoryId ? 'repository_id=?' : 'repository_id IS NULL'} ORDER BY name`).all(...(repositoryId ? [projectId, repositoryId] : [projectId])) as unknown as Row[];
   }
   private metadata(row: Row, inherited = false, overridden = false): EnvironmentVariableMetadata {
-    return { id: row.id, key: row.name, environment: row.environment, scope: row.repository_id ? 'repository' : 'project',
+    return { id: row.id, key: row.name, scope: row.repository_id ? 'repository' : 'project',
       projectId: row.project_id, repositoryId: row.repository_id ?? undefined, classification: row.classification,
       allowAgentAccess: Boolean(row.allow_agent_access), inherited, overridden, masked: true, createdAt: row.created_at, updatedAt: row.updated_at };
   }
-  list(projectId: string, repositoryId: string | undefined, environment: EnvironmentName): EnvironmentVariableMetadata[] {
-    const project = this.rows(projectId, undefined, environment);
+  list(projectId: string, repositoryId?: string): EnvironmentVariableMetadata[] {
+    const project = this.rows(projectId);
     if (!repositoryId) return project.map((row) => this.metadata(row));
-    const repository = this.rows(projectId, repositoryId, environment); const overrides = new Set(repository.map((row) => row.name));
+    const repository = this.rows(projectId, repositoryId); const overrides = new Set(repository.map((row) => row.name));
     return [...project.map((row) => this.metadata(row, true, overrides.has(row.name))), ...repository.map((row) => this.metadata(row))];
   }
-  save(input: { projectId: string; repositoryId?: string; environment: EnvironmentName; key: string; value: string; classification: VariableClassification; allowAgentAccess: boolean }, replace = false): EnvironmentVariableMetadata {
+  save(input: { projectId: string; repositoryId?: string; key: string; value: string; classification: VariableClassification; allowAgentAccess: boolean }, replace = false): EnvironmentVariableMetadata {
     validateVariableName(input.key);
     if (Object.prototype.hasOwnProperty.call(process.env, input.key)) throw new EnvironmentValidationError(`Service environment variable name is reserved: ${input.key}`);
     if (input.classification !== 'secret' && input.classification !== 'public') throw new EnvironmentValidationError('Invalid variable classification');
-    const existing = this.db.prepare('SELECT id FROM environment_variables WHERE project_id=? AND repository_id IS ? AND environment=? AND name=?').get(input.projectId, input.repositoryId ?? null, input.environment, input.key) as { id: string } | undefined;
+    const existing = this.db.prepare('SELECT id FROM environment_variables WHERE project_id=? AND repository_id IS ? AND name=?').get(input.projectId, input.repositoryId ?? null, input.key) as { id: string } | undefined;
     if (Boolean(existing) !== replace) throw new EnvironmentValidationError(existing ? 'Variable already exists; use replace' : 'Variable does not exist');
     if (!existing) {
-      const count = this.db.prepare('SELECT COUNT(*) count FROM environment_variables WHERE project_id=? AND repository_id IS ? AND environment=?').get(input.projectId, input.repositoryId ?? null, input.environment) as { count: number };
+      const count = this.db.prepare('SELECT COUNT(*) count FROM environment_variables WHERE project_id=? AND repository_id IS ?').get(input.projectId, input.repositoryId ?? null) as { count: number };
       if (count.count >= ENV_LIMITS.maxVariablesPerScope) throw new EnvironmentValidationError('Environment variable limit reached');
     }
     const encrypted = encryptValue(this.keys.get(this.activeKeyVersion)!, input.value, { ...input, name: input.key, keyVersion: this.activeKeyVersion });
@@ -170,28 +167,28 @@ export class EnvironmentVariableService {
       if (existing) this.db.prepare('UPDATE environment_variables SET ciphertext=?,iv=?,auth_tag=?,key_version=?,classification=?,allow_agent_access=?,updated_at=? WHERE id=?')
         .run(encrypted.ciphertext, encrypted.iv, encrypted.authTag, encrypted.keyVersion, input.classification, input.allowAgentAccess ? 1 : 0, now, id);
       else this.db.prepare('INSERT INTO environment_variables VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
-        .run(id, input.projectId, input.repositoryId ?? null, input.environment, input.key, encrypted.ciphertext, encrypted.iv, encrypted.authTag, encrypted.keyVersion, input.classification, input.allowAgentAccess ? 1 : 0, now, now);
+        .run(id, input.projectId, input.repositoryId ?? null, 'development', input.key, encrypted.ciphertext, encrypted.iv, encrypted.authTag, encrypted.keyVersion, input.classification, input.allowAgentAccess ? 1 : 0, now, now);
       this.db.prepare('INSERT INTO environment_variable_audit(id,project_id,repository_id,environment,name,action,classification,allow_agent_access,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
-        .run(randomUUID(), input.projectId, input.repositoryId ?? null, input.environment, input.key, existing ? 'replace' : 'create', input.classification, input.allowAgentAccess ? 1 : 0, now);
+        .run(randomUUID(), input.projectId, input.repositoryId ?? null, 'shared', input.key, existing ? 'replace' : 'create', input.classification, input.allowAgentAccess ? 1 : 0, now);
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     return this.metadata(this.db.prepare('SELECT * FROM environment_variables WHERE id=?').get(id) as unknown as Row);
   }
-  delete(projectId: string, repositoryId: string | undefined, environment: EnvironmentName, name: string): boolean {
-    const row = this.db.prepare('SELECT * FROM environment_variables WHERE project_id=? AND repository_id IS ? AND environment=? AND name=?').get(projectId, repositoryId ?? null, environment, name) as unknown as Row | undefined;
+  delete(projectId: string, repositoryId: string | undefined, name: string): boolean {
+    const row = this.db.prepare('SELECT * FROM environment_variables WHERE project_id=? AND repository_id IS ? AND name=?').get(projectId, repositoryId ?? null, name) as unknown as Row | undefined;
     if (!row) return false;
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.db.prepare('DELETE FROM environment_variables WHERE id=?').run(row.id);
       this.db.prepare('INSERT INTO environment_variable_audit(id,project_id,repository_id,environment,name,action,classification,allow_agent_access,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
-        .run(randomUUID(), projectId, repositoryId ?? null, environment, name, 'delete', row.classification, row.allow_agent_access, new Date().toISOString());
+        .run(randomUUID(), projectId, repositoryId ?? null, 'shared', name, 'delete', row.classification, row.allow_agent_access, new Date().toISOString());
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
     return true;
   }
-  resolve(projectId: string, repositoryId: string, environment: EnvironmentName, agentOnly = false): NodeJS.ProcessEnv {
-    const merged = new Map(this.rows(projectId, undefined, environment).map((row) => [row.name, row]));
-    for (const row of this.rows(projectId, repositoryId, environment)) merged.set(row.name, row);
+  resolve(projectId: string, repositoryId: string, agentOnly = false): NodeJS.ProcessEnv {
+    const merged = new Map(this.rows(projectId).map((row) => [row.name, row]));
+    for (const row of this.rows(projectId, repositoryId)) merged.set(row.name, row);
     const output: NodeJS.ProcessEnv = {};
     for (const row of merged.values()) {
       if (agentOnly && !row.allow_agent_access) continue;

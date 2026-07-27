@@ -18,7 +18,7 @@ import { DEPLOYMENT_STATUSES } from './types.js';
 import { MaintenanceService } from './maintenance.js';
 import { AttachmentStorage, ATTACHMENT_LIMITS } from './attachments.js';
 import { GitHubAppAuth } from './github-app.js';
-import { ENVIRONMENTS, EnvironmentConfigurationError, EnvironmentValidationError, EnvironmentVariableService, loadMasterKey, parseDotenv, type EnvironmentName } from './environment-variables.js';
+import { EnvironmentConfigurationError, EnvironmentValidationError, EnvironmentVariableService, loadMasterKey, parseDotenv } from './environment-variables.js';
 
 export interface AppOptions {
   databasePath?: string;
@@ -116,7 +116,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const githubApp = new GitHubAppAuth();
   const deploymentCoordinator = new DeploymentCoordinator(store, options.backendDeployRepositoryPath ?? process.env.BACKEND_DEPLOY_REPOSITORY_PATH, options.deploymentStarter ?? systemdDeploymentStarter());
   const promotion = new PromotionService(store, workspaceRoot, absoluteRunsRoot, deploymentCoordinator,
-    environmentVariables ? (projectId, repositoryId) => environmentVariables.resolve(projectId, repositoryId, 'test') : undefined);
+    environmentVariables ? (projectId, repositoryId) => environmentVariables.resolve(projectId, repositoryId) : undefined);
   const bus = new JobEventBus();
   const allowMockAgent = options.allowMockAgent ?? process.env.NODE_ENV === 'test';
   const capabilities = buildCapabilities({
@@ -143,8 +143,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
       log: app.log,
       environment: environmentVariables ? (job, repositories) => {
-        if (repositories.length === 1) return environmentVariables.resolve(job.projectId, repositories[0]!.id, 'development', true);
-        const resolved = repositories.map((repository) => environmentVariables.resolve(job.projectId, repository.id, 'development', true));
+        if (repositories.length === 1) return environmentVariables.resolve(job.projectId, repositories[0]!.id, true);
+        const resolved = repositories.map((repository) => environmentVariables.resolve(job.projectId, repository.id, true));
         const common: NodeJS.ProcessEnv = {};
         for (const [key, value] of Object.entries(resolved[0] ?? {})) if (resolved.every((item) => item[key] === value)) common[key] = value;
         return common;
@@ -159,8 +159,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
       log: app.log,
       environment: environmentVariables ? (job, repositories) => {
-        if (repositories.length === 1) return environmentVariables.resolve(job.projectId, repositories[0]!.id, 'development', true);
-        const resolved = repositories.map((repository) => environmentVariables.resolve(job.projectId, repository.id, 'development', true));
+        if (repositories.length === 1) return environmentVariables.resolve(job.projectId, repositories[0]!.id, true);
+        const resolved = repositories.map((repository) => environmentVariables.resolve(job.projectId, repository.id, true));
         const common: NodeJS.ProcessEnv = {};
         for (const [key, value] of Object.entries(resolved[0] ?? {})) if (resolved.every((item) => item[key] === value)) common[key] = value;
         return common;
@@ -216,20 +216,16 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   });
   const onboardingLocks = new Map<string, Promise<unknown>>();
 
-  const environmentName = (value: unknown): EnvironmentName => {
-    if (typeof value !== 'string' || !ENVIRONMENTS.includes(value as EnvironmentName)) throw new EnvironmentValidationError('Invalid environment');
-    return value as EnvironmentName;
-  };
   const environmentService = () => {
     if (!environmentVariables) throw new EnvironmentConfigurationError('Environment variable encryption is unavailable');
     return environmentVariables;
   };
   const environmentScope = (request: { params: unknown }) => {
-    const params = request.params as { id?: string; repositoryId?: string; environment?: string };
+    const params = request.params as { id?: string; repositoryId?: string };
     const project = params.id ? store.getProject(params.id) : undefined;
     if (!project) return undefined;
     if (params.repositoryId && !project.repositories.some((repository) => repository.id === params.repositoryId)) return undefined;
-    return { projectId: project.id, repositoryId: params.repositoryId, environment: environmentName(params.environment) };
+    return { projectId: project.id, repositoryId: params.repositoryId };
   };
   const variableInput = (body: unknown): { key: string; value: string; classification: 'secret' | 'public'; allowAgentAccess: boolean } => {
     const input = body as Record<string, unknown> | null;
@@ -240,7 +236,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     return { key: input.key, value: input.value, classification: input.classification, allowAgentAccess: input.allowAgentAccess };
   };
 
-  for (const base of ['/projects/:id/environments/:environment/variables', '/projects/:id/repositories/:repositoryId/environments/:environment/variables']) {
+  for (const base of ['/projects/:id/variables', '/projects/:id/repositories/:repositoryId/variables']) {
     app.get(base, async (request, reply) => {
       const scope = environmentScope(request); if (!scope) return reply.code(404).send({ error: 'Scope not found' });
       const project = store.getProject(scope.projectId)!;
@@ -250,7 +246,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
         try { for (const item of parseDotenv(readFileSync(resolve(repository.path, '.env.example'), 'utf8'))) suggested.add(item.key); }
         catch { /* Suggestions are optional; missing or malformed examples never block management. */ }
       }
-      const variables = environmentService().list(scope.projectId, scope.repositoryId, scope.environment);
+      const variables = environmentService().list(scope.projectId, scope.repositoryId);
       const present = new Set(variables.map((item) => item.key));
       return { variables, suggestions: [...suggested].filter((key) => !present.has(key)).sort() };
     });
@@ -266,7 +262,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     });
     app.delete(`${base}/:key`, async (request, reply) => {
       const scope = environmentScope(request); if (!scope) return reply.code(404).send({ error: 'Scope not found' });
-      const deleted = environmentService().delete(scope.projectId, scope.repositoryId, scope.environment, (request.params as { key: string }).key);
+      const deleted = environmentService().delete(scope.projectId, scope.repositoryId, (request.params as { key: string }).key);
       return deleted ? reply.code(204).send() : reply.code(404).send({ error: 'Variable not found' });
     });
     app.post(`${base}/import`, async (request, reply) => {
@@ -274,7 +270,7 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       const body = request.body as { content?: unknown; confirm?: unknown; classification?: unknown; allowAgentAccess?: unknown } | null;
       if (!body || typeof body.content !== 'string') throw new EnvironmentValidationError('Dotenv content is required');
       const entries = parseDotenv(body.content);
-      const existing = new Set(environmentService().list(scope.projectId, scope.repositoryId, scope.environment)
+      const existing = new Set(environmentService().list(scope.projectId, scope.repositoryId)
         .filter((item) => item.scope === (scope.repositoryId ? 'repository' : 'project')).map((item) => item.key));
       if (entries.some((entry) => existing.has(entry.key))) throw new EnvironmentValidationError('Import conflicts with an existing variable');
       if (body.confirm !== true) return { variables: entries.map(({ key }) => ({ key })), count: entries.length };

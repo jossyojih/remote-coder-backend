@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
-import { Store } from '../src/database.js';
+import { EnvironmentVariableMigrationConflictError, Store } from '../src/database.js';
 import {
   decryptValue, encryptValue, EnvironmentVariableService, loadMasterKey, parseDotenv, validateVariableName,
 } from '../src/environment-variables.js';
@@ -62,27 +62,57 @@ describe('storage, inheritance, rotation, redaction, and API masking', () => {
     const service = new EnvironmentVariableService(store.db, new Map([[1, key]]));
     return { store, project, repositoryId: project.repositories[0]!.id, service };
   }
-  test('separates environments and applies repository overrides', () => {
+  test('uses one shared set and applies repository overrides', () => {
     const { service, project, repositoryId } = fixture();
-    service.save({ projectId: project.id, environment: 'development', key: 'A', value: 'alpha-fixture', classification: 'secret', allowAgentAccess: false });
-    service.save({ projectId: project.id, repositoryId, environment: 'development', key: 'A', value: 'beta-fixture', classification: 'secret', allowAgentAccess: true });
-    service.save({ projectId: project.id, environment: 'test', key: 'A', value: 'gamma-fixture', classification: 'public', allowAgentAccess: false });
-    assert.deepEqual(service.resolve(project.id, repositoryId, 'development'), { A: 'beta-fixture' });
-    assert.deepEqual(service.resolve(project.id, repositoryId, 'development', true), { A: 'beta-fixture' });
-    assert.deepEqual(service.resolve(project.id, repositoryId, 'test'), { A: 'gamma-fixture' });
-    const listed = service.list(project.id, repositoryId, 'development');
+    service.save({ projectId: project.id, key: 'A', value: 'alpha-fixture', classification: 'secret', allowAgentAccess: false });
+    service.save({ projectId: project.id, repositoryId, key: 'A', value: 'beta-fixture', classification: 'secret', allowAgentAccess: true });
+    assert.deepEqual(service.resolve(project.id, repositoryId), { A: 'beta-fixture' });
+    assert.deepEqual(service.resolve(project.id, repositoryId, true), { A: 'beta-fixture' });
+    const listed = service.list(project.id, repositoryId);
     assert.equal(listed[0]!.inherited, true); assert.equal(listed[0]!.overridden, true);
-    assert.doesNotMatch(JSON.stringify(listed), /alpha-fixture|beta-fixture|gamma-fixture/);
+    assert.doesNotMatch(JSON.stringify(listed), /alpha-fixture|beta-fixture/);
+    assert.equal('environment' in listed[0]!, false);
   });
   test('denies agent access by default and rotates without exposing plaintext', () => {
     const { service, store, project, repositoryId } = fixture();
-    service.save({ projectId: project.id, environment: 'development', key: 'DENIED', value: 'hidden', classification: 'secret', allowAgentAccess: false });
-    assert.deepEqual(service.resolve(project.id, repositoryId, 'development', true), {});
+    service.save({ projectId: project.id, key: 'DENIED', value: 'hidden', classification: 'secret', allowAgentAccess: false });
+    assert.deepEqual(service.resolve(project.id, repositoryId, true), {});
     const next = Buffer.alloc(32, 9);
     assert.equal(service.rotate(2, next), 1);
     const rotated = new EnvironmentVariableService(store.db, new Map([[2, next]]), 2);
-    assert.deepEqual(rotated.resolve(project.id, repositoryId, 'development'), { DENIED: 'hidden' });
+    assert.deepEqual(rotated.resolve(project.id, repositoryId), { DENIED: 'hidden' });
     assert.doesNotMatch(JSON.stringify(store.db.prepare('SELECT * FROM environment_variable_audit').all()), /hidden/);
+  });
+  test('migrates one legacy value without rewriting it and blocks ambiguous legacy sets safely', () => {
+    const root = mkdtempSync(join(tmpdir(), 'env-migration-')); const path = join(root, 'variables.sqlite');
+    const initial = new Store(path);
+    const project = initial.createProject('P', [{ name: 'R', path: join(root, 'repo') }]);
+    const encrypted = encryptValue(key, 'legacy-secret-value', { projectId: project.id, environment: 'production', name: 'TOKEN' });
+    initial.db.prepare('INSERT INTO environment_variables VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(
+      'legacy-production', project.id, null, 'production', 'TOKEN', encrypted.ciphertext, encrypted.iv,
+      encrypted.authTag, 1, 'secret', 0, '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z',
+    );
+    initial.db.close();
+
+    const migrated = new Store(path);
+    const service = new EnvironmentVariableService(migrated.db, new Map([[1, key]]));
+    assert.deepEqual(service.resolve(project.id, project.repositories[0]!.id), { TOKEN: 'legacy-secret-value' });
+    migrated.db.exec('DROP INDEX environment_variables_shared_project_unique');
+    const second = encryptValue(key, 'different-secret-value', { projectId: project.id, environment: 'test', name: 'TOKEN' });
+    migrated.db.prepare('INSERT INTO environment_variables VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(
+      'legacy-test', project.id, null, 'test', 'TOKEN', second.ciphertext, second.iv, second.authTag, 1,
+      'secret', 0, '2025-01-02T00:00:00.000Z', '2025-01-02T00:00:00.000Z',
+    );
+    migrated.db.close();
+
+    assert.throws(() => new Store(path), (error: unknown) => {
+      assert.ok(error instanceof EnvironmentVariableMigrationConflictError);
+      assert.deepEqual(error.conflicts, [{
+        projectId: project.id, repositoryId: null, key: 'TOKEN', environments: ['production', 'test'],
+      }]);
+      assert.doesNotMatch(error.message, /legacy-secret-value|different-secret-value/);
+      return true;
+    });
   });
   test('API responses and logs never return saved or imported values', async () => {
     const root = mkdtempSync(join(tmpdir(), 'env-api-')); const repo = join(root, 'repo');
@@ -91,11 +121,18 @@ describe('storage, inheritance, rotation, redaction, and API masking', () => {
     const built = await buildApp({ databasePath: ':memory:', workspaceRoot: root, apiToken: 'token', repositoryEnvKey: key, loggerStream });
     const auth = { authorization: 'Bearer token' };
     const project = (await built.app.inject({ method: 'POST', url: '/projects', headers: auth, payload: { name: 'P', repositories: [{ name: 'R', path: repo }] } })).json();
-    const base = `/projects/${project.id}/environments/development/variables`;
+    const base = `/projects/${project.id}/variables`;
     const secret = 'fixture-value-never-production';
     const created = await built.app.inject({ method: 'POST', url: base, headers: auth, payload: { key: 'SAFE_TOKEN', value: secret, classification: 'secret', allowAgentAccess: false } });
     assert.equal(created.statusCode, 201); assert.doesNotMatch(created.body, new RegExp(secret));
+    assert.equal('environment' in created.json(), false);
     const listed = await built.app.inject({ url: base, headers: auth }); assert.doesNotMatch(listed.body, new RegExp(secret));
+    const repositoryBase = `/projects/${project.id}/repositories/${project.repositories[0].id}/variables`;
+    const overridden = await built.app.inject({ method: 'POST', url: repositoryBase, headers: auth, payload: { key: 'SAFE_TOKEN', value: `${secret}-override`, classification: 'public', allowAgentAccess: true } });
+    assert.equal(overridden.statusCode, 201); assert.doesNotMatch(overridden.body, new RegExp(secret));
+    const repositoryList = await built.app.inject({ url: repositoryBase, headers: auth });
+    assert.equal(repositoryList.json().variables.find((item: { scope: string }) => item.scope === 'project').overridden, true);
+    assert.equal((await built.app.inject({ url: `/projects/${project.id}/environments/development/variables`, headers: auth })).statusCode, 404);
     const preview = await built.app.inject({ method: 'POST', url: `${base}/import`, headers: auth, payload: { content: `OTHER=${secret}`, confirm: false } });
     assert.deepEqual(preview.json().variables, [{ key: 'OTHER' }]);
     assert.doesNotMatch(logs, new RegExp(secret));
