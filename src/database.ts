@@ -176,6 +176,23 @@ export class Store {
         validated_at TEXT NOT NULL,
         PRIMARY KEY(promotion_id, repository_id)
       );
+      CREATE TABLE IF NOT EXISTS environment_variables (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repository_id TEXT REFERENCES repositories(id) ON DELETE CASCADE,
+        environment TEXT NOT NULL CHECK(environment IN ('development','test','production')), name TEXT NOT NULL,
+        ciphertext BLOB NOT NULL, iv BLOB NOT NULL, auth_tag BLOB NOT NULL, key_version INTEGER NOT NULL,
+        classification TEXT NOT NULL CHECK(classification IN ('secret','public')), allow_agent_access INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(project_id,repository_id,environment,name)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS environment_variables_project_unique
+        ON environment_variables(project_id,environment,name) WHERE repository_id IS NULL;
+      CREATE TABLE IF NOT EXISTS environment_variable_audit (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repository_id TEXT, environment TEXT NOT NULL, name TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('create','replace','delete')),
+        classification TEXT NOT NULL, allow_agent_access INTEGER NOT NULL, created_at TEXT NOT NULL
+      );
     `);
     // A process that died mid-job leaves work recoverable.
     this.db.prepare("UPDATE jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());

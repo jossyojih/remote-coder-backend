@@ -47,7 +47,7 @@ async function diffStats(worktree: string, args: string[]): Promise<{ additions:
 }
 
 export class PromotionService {
-  constructor(private readonly store: Store, private readonly workspaceRoot: string, private readonly runsRoot: string, private readonly deployments?: DeploymentCoordinator) {}
+  constructor(private readonly store: Store, private readonly workspaceRoot: string, private readonly runsRoot: string, private readonly deployments?: DeploymentCoordinator, private readonly validationEnvironment?: (projectId: string, repositoryId: string) => NodeJS.ProcessEnv) {}
 
   private async validateRun(run: JobRepositoryRun) {
     const workspace = await realpath(this.workspaceRoot); const runs = await realpath(this.runsRoot);
@@ -118,7 +118,8 @@ export class PromotionService {
     if (approvedIds.some((id) => !existingIds.includes(id))) throw new PromotionConflictError('Approved repositories could not be added to the promotion', 'approval_mismatch');
 
     const validationConfigs = new Map(repositories.map((r) => [r.id, this.store.getValidationConfig(r.id)]));
-    const validationResults = await validateRepositories(repositories, runs, validationConfigs);
+    const job = this.store.getJob(jobId)!;
+    const validationResults = await validateRepositories(repositories, runs, validationConfigs, (repositoryId) => this.validationEnvironment?.(job.projectId, repositoryId) ?? {});
     this.store.saveValidationResults(existing.id, validationResults);
 
     const failedValidation = validationResults.filter((r) => !r.passed);

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import type { FastifyBaseLogger } from 'fastify';
-import { buildJobPrompt, childEnvironment, collectChanges, parseScopeRequired, prepareRepositories, stopProcess } from './agent-runtime.js';
+import { buildJobPrompt, childEnvironment, collectChanges, parseScopeRequired, prepareRepositories, redactEnvironmentSecrets, stopProcess } from './agent-runtime.js';
 import type { AgentAdapter, AgentEventEmitter, Job, Repository } from './types.js';
 
 export interface ClaudeAdapterOptions {
@@ -11,6 +11,7 @@ export interface ClaudeAdapterOptions {
   timeoutMs: number;
   killGraceMs: number;
   log: FastifyBaseLogger;
+  environment?: (job: Job, repositories: Repository[]) => NodeJS.ProcessEnv;
 }
 
 export class ClaudeTimeoutError extends Error {
@@ -100,17 +101,19 @@ export class ClaudeAgentAdapter implements AgentAdapter {
 
   async run(job: Job, repositories: Repository[], emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
     const { runDirectory, prepared } = await prepareRepositories(job, repositories, this.options.workspaceRoot, this.options.runsRoot, emit);
-    await this.executeClaude(job.id, job.model, buildJobPrompt(job, prepared, runDirectory, job.attachmentPaths), runDirectory, emit, signal);
+    const environment = this.options.environment?.(job, repositories) ?? {};
+    const safeEmit: AgentEventEmitter = (type, message, data) => emit(type, redactEnvironmentSecrets(message, environment), redactEnvironmentSecrets(data, environment));
+    await this.executeClaude(job.id, job.model, buildJobPrompt(job, prepared, runDirectory, job.attachmentPaths), runDirectory, safeEmit, signal, environment);
     for (const repository of prepared) {
-      try { emit('repository_result', `Collected changes for ${repository.repository.name}`, { ...(await collectChanges(repository)), scopeReason: job.scopeReasons.find((reason) => reason.repositoryId === repository.repository.id)?.reason }); }
+      try { safeEmit('repository_result', `Collected changes for ${repository.repository.name}`, { ...(await collectChanges(repository)), scopeReason: job.scopeReasons.find((reason) => reason.repositoryId === repository.repository.id)?.reason }); }
       catch (error) { emit('error', `Could not collect changes for ${repository.repository.name}`, { error: error instanceof Error ? error.message : String(error) }); }
     }
   }
 
-  private executeClaude(jobId: string, model: string, prompt: string, runDirectory: string, emit: AgentEventEmitter, signal: AbortSignal): Promise<void> {
+  private executeClaude(jobId: string, model: string, prompt: string, runDirectory: string, emit: AgentEventEmitter, signal: AbortSignal, environment: NodeJS.ProcessEnv): Promise<void> {
     return new Promise((resolve, reject) => {
       const args = ['--print', '--output-format', 'stream-json', '--verbose', '--model', model, '--permission-mode', 'dontAsk', '--allowedTools', 'Bash,Edit,Write,Read,Glob,Grep', '--no-session-persistence', '--disable-slash-commands', '--no-chrome', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'];
-      const child = spawn(this.options.claudeBin, args, { cwd: runDirectory, env: childEnvironment('claude'), detached: process.platform === 'linux', stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = spawn(this.options.claudeBin, args, { cwd: runDirectory, env: childEnvironment('claude', environment), detached: process.platform === 'linux', stdio: ['pipe', 'pipe', 'pipe'] });
       let settled = false; let timedOut = false; let protocolCompleted = false; let protocolError: Error | undefined; let finalResponse: TranslatedEvent | undefined;
       this.options.log.info({ jobId, adapter: 'claude', childPid: child.pid }, 'agent child started');
       const finish = (error?: unknown) => { if (settled) return; settled = true; clearTimeout(timeout); signal.removeEventListener('abort', abort); error ? reject(error) : resolve(); };

@@ -1,4 +1,4 @@
-import { runCommand } from './agent-runtime.js';
+import { redactEnvironmentSecrets, runCommand } from './agent-runtime.js';
 import type { Repository } from './types.js';
 
 export interface ValidationCommand {
@@ -47,7 +47,8 @@ export function getDefaultValidationCommands(repository: Repository): Validation
 export async function validateRepository(
   repository: Repository,
   worktreePath: string,
-  config: RepositoryValidationConfig
+  config: RepositoryValidationConfig,
+  environment: NodeJS.ProcessEnv = {},
 ): Promise<ValidationResult> {
   const commands = config.enabled ? config.commands : [];
   const results: ValidationResult['results'] = [];
@@ -55,13 +56,13 @@ export async function validateRepository(
 
   for (const { command, args, description } of commands) {
     try {
-      const { stdout, stderr } = await runCommand(command, args, worktreePath);
+      const { stdout, stderr } = await runCommand(command, args, worktreePath, undefined, environment);
       results.push({
         command: `${command} ${args.join(' ')}`,
         description,
         exitCode: 0,
-        stdout: stdout.slice(0, 4096),
-        stderr: stderr.slice(0, 4096),
+        stdout: redactEnvironmentSecrets(stdout.slice(0, 4096), environment),
+        stderr: redactEnvironmentSecrets(stderr.slice(0, 4096), environment),
         passed: true,
       });
     } catch (error) {
@@ -69,7 +70,7 @@ export async function validateRepository(
       const exitCode = error instanceof Error && /failed \((\d+)\)/.test(error.message)
         ? Number(error.message.match(/failed \((\d+)\)/)?.[1] ?? 1)
         : 1;
-      const message = error instanceof Error ? error.message : String(error);
+      const message = redactEnvironmentSecrets(error instanceof Error ? error.message : String(error), environment);
       results.push({
         command: `${command} ${args.join(' ')}`,
         description,
@@ -92,7 +93,8 @@ export async function validateRepository(
 export async function validateRepositories(
   repositories: Repository[],
   runs: Array<{ repositoryId: string; worktreePath: string }>,
-  config: Map<string, RepositoryValidationConfig>
+  config: Map<string, RepositoryValidationConfig>,
+  environment?: (repositoryId: string) => NodeJS.ProcessEnv,
 ): Promise<ValidationResult[]> {
   const results: ValidationResult[] = [];
 
@@ -101,7 +103,7 @@ export async function validateRepositories(
     if (!repository) continue;
 
     const validationConfig = config.get(run.repositoryId) ?? { enabled: false, commands: [] };
-    const result = await validateRepository(repository, run.worktreePath, validationConfig);
+    const result = await validateRepository(repository, run.worktreePath, validationConfig, environment?.(run.repositoryId));
     results.push(result);
   }
 

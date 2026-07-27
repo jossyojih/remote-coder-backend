@@ -101,3 +101,27 @@ sudo systemctl restart remote-coder-backend.service
 Remove the two obsolete `/etc/sudoers.d/remote-coder-deployment*` files from installations that used the previous setup after verifying the Polkit rule is installed. Do not add a replacement sudoers grant. The rule permits `ubuntu` only to start `remote-coder-deploy@*.service` instances and restart `remote-coder-backend.service`; it explicitly rejects every other systemd unit operation for that user.
 
 The backend and deployment script invoke `/usr/bin/systemctl` directly. Never put either token on a command line. Deployment command output is discarded, and persisted failures use bounded error codes only. The script requires a clean checkout with the configured target branch attached, fetches that branch, verifies the approved SHA belongs to it and is a fast-forward from the current checkout, then fast-forwards the local branch to exactly that SHA (never implicitly to a newer remote tip). It keeps the branch checked out while running `npm ci`, `npm test`, and `npm run build`, restarting `remote-coder-backend.service`, and verifying `/health`. On failure after the branch update it restores the same attached branch to its previous SHA, rebuilds, restarts, checks health, and records `rolled_back`; a failed rollback records `failed`.
+
+# Repository environment encryption key (one-time EC2 setup)
+
+Stored project and repository environment values require a 32-byte master key in a protected file outside every checkout. Run these commands once on the EC2 host, replacing the service account and application path where needed:
+
+```sh
+sudo install -d -m 0700 -o remote-coder -g remote-coder /etc/remote-coder
+cd /opt/remote-coder/backend
+sudo -u remote-coder npm run generate:env-key -- /etc/remote-coder/repository-env.key
+sudo chown remote-coder:remote-coder /etc/remote-coder/repository-env.key
+sudo chmod 0600 /etc/remote-coder/repository-env.key
+sudo systemctl edit remote-coder
+```
+
+Add this exact systemd override:
+
+```ini
+[Service]
+Environment=REPOSITORY_ENV_KEY_PATH=/etc/remote-coder/repository-env.key
+```
+
+Then run `sudo systemctl daemon-reload && sudo systemctl restart remote-coder`. Back up the key separately from SQLite with equivalent access controls. Losing it makes saved values unrecoverable. Do not put it in Git, SQLite, application logs, browser storage, an `.env` file, or a deployment argument. Startup fails closed outside tests when the path is absent, the target is a symlink/non-file, permissions grant any group/other access, or the key is not exactly 32 bytes.
+
+The ciphertext schema stores a key version and supports transactional re-encryption. Keep the old key available until a future rotation command completes; rotation decrypts only in memory and never returns plaintext.

@@ -1,4 +1,4 @@
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { Writable } from 'node:stream';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -18,6 +18,7 @@ import { DEPLOYMENT_STATUSES } from './types.js';
 import { MaintenanceService } from './maintenance.js';
 import { AttachmentStorage, ATTACHMENT_LIMITS } from './attachments.js';
 import { GitHubAppAuth } from './github-app.js';
+import { ENVIRONMENTS, EnvironmentConfigurationError, EnvironmentValidationError, EnvironmentVariableService, loadMasterKey, parseDotenv, type EnvironmentName } from './environment-variables.js';
 
 export interface AppOptions {
   databasePath?: string;
@@ -60,6 +61,8 @@ export interface AppOptions {
   cleanupBatchLimit?: number;
   maintenanceCleanupEnabled?: boolean;
   attachmentsRoot?: string;
+  repositoryEnvKeyPath?: string;
+  repositoryEnvKey?: Buffer;
 }
 
 export interface CommandCenterApp {
@@ -82,8 +85,8 @@ function validatedRepositoryPath(input: string, workspaceRoot: string): string {
 
 export async function buildApp(options: AppOptions = {}): Promise<CommandCenterApp> {
   const logger = options.loggerStream
-    ? { level: 'info', stream: options.loggerStream, redact: { paths: ['req.headers.authorization', 'req.body.password', 'req.body.prompt', 'req.body.message', 'res.body.accessToken'], censor: '[REDACTED]' } }
-    : (options.logger ? { redact: { paths: ['req.headers.authorization', 'req.body.password', 'req.body.prompt', 'req.body.message', 'res.body.accessToken'], censor: '[REDACTED]' } } : false);
+    ? { level: 'info', stream: options.loggerStream, redact: { paths: ['req.headers.authorization', 'req.body.password', 'req.body.prompt', 'req.body.message', 'req.body.value', 'req.body.content', 'req.body.variables[*].value', 'res.body.accessToken'], censor: '[REDACTED]' } }
+    : (options.logger ? { redact: { paths: ['req.headers.authorization', 'req.body.password', 'req.body.prompt', 'req.body.message', 'req.body.value', 'req.body.content', 'req.body.variables[*].value', 'res.body.accessToken'], censor: '[REDACTED]' } } : false);
   const app = Fastify({ logger });
   await app.register(multipart, {
     limits: { fileSize: ATTACHMENT_LIMITS.maxFileSize, files: ATTACHMENT_LIMITS.maxFilesPerJob },
@@ -99,13 +102,21 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   const loginLimiter = new LoginRateLimiter(options.loginRateLimit, loginRateWindowMs, now);
   const workspaceRoot = options.workspaceRoot ?? process.env.WORKSPACE_ROOT ?? process.cwd();
   const store = new Store(options.databasePath ?? process.env.DATABASE_PATH ?? './data/command-center.sqlite');
+  const repositoryEnvKeyPath = options.repositoryEnvKeyPath ?? process.env.REPOSITORY_ENV_KEY_PATH;
+  if (!options.repositoryEnvKey && !repositoryEnvKeyPath && process.env.NODE_ENV !== 'test') {
+    throw new EnvironmentConfigurationError('REPOSITORY_ENV_KEY_PATH is required');
+  }
+  const environmentVariables = options.repositoryEnvKey || repositoryEnvKeyPath
+    ? new EnvironmentVariableService(store.db, new Map([[1, options.repositoryEnvKey ?? loadMasterKey(repositoryEnvKeyPath!)]]))
+    : undefined;
   const runsRoot = options.runsRoot ?? process.env.RUNS_ROOT ?? './data/runs';
   const absoluteRunsRoot = isAbsolute(runsRoot) ? runsRoot : resolve(process.cwd(), runsRoot);
   const attachmentsRoot = options.attachmentsRoot ?? process.env.ATTACHMENTS_ROOT ?? resolve(process.cwd(), './data/attachments');
   const attachments = new AttachmentStorage(attachmentsRoot);
   const githubApp = new GitHubAppAuth();
   const deploymentCoordinator = new DeploymentCoordinator(store, options.backendDeployRepositoryPath ?? process.env.BACKEND_DEPLOY_REPOSITORY_PATH, options.deploymentStarter ?? systemdDeploymentStarter());
-  const promotion = new PromotionService(store, workspaceRoot, absoluteRunsRoot, deploymentCoordinator);
+  const promotion = new PromotionService(store, workspaceRoot, absoluteRunsRoot, deploymentCoordinator,
+    environmentVariables ? (projectId, repositoryId) => environmentVariables.resolve(projectId, repositoryId, 'test') : undefined);
   const bus = new JobEventBus();
   const allowMockAgent = options.allowMockAgent ?? process.env.NODE_ENV === 'test';
   const capabilities = buildCapabilities({
@@ -131,6 +142,13 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
       log: app.log,
+      environment: environmentVariables ? (job, repositories) => {
+        if (repositories.length === 1) return environmentVariables.resolve(job.projectId, repositories[0]!.id, 'development', true);
+        const resolved = repositories.map((repository) => environmentVariables.resolve(job.projectId, repository.id, 'development', true));
+        const common: NodeJS.ProcessEnv = {};
+        for (const [key, value] of Object.entries(resolved[0] ?? {})) if (resolved.every((item) => item[key] === value)) common[key] = value;
+        return common;
+      } : undefined,
     }),
     claude: new ClaudeAgentAdapter({
       claudeBin: options.claudeBin ?? process.env.CLAUDE_BIN ?? 'claude',
@@ -140,6 +158,13 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
       timeoutMs: options.jobTimeoutMs ?? Number(process.env.JOB_TIMEOUT_MS ?? 1_800_000),
       killGraceMs: options.jobKillGraceMs ?? Number(process.env.JOB_KILL_GRACE_MS ?? 5_000),
       log: app.log,
+      environment: environmentVariables ? (job, repositories) => {
+        if (repositories.length === 1) return environmentVariables.resolve(job.projectId, repositories[0]!.id, 'development', true);
+        const resolved = repositories.map((repository) => environmentVariables.resolve(job.projectId, repository.id, 'development', true));
+        const common: NodeJS.ProcessEnv = {};
+        for (const [key, value] of Object.entries(resolved[0] ?? {})) if (resolved.every((item) => item[key] === value)) common[key] = value;
+        return common;
+      } : undefined,
     }),
   }, app.log, 25, undefined, (jobId) => promotion.applyEffectivePolicies(jobId), attachments);
 
@@ -169,6 +194,8 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ZodError) return reply.code(400).send({ error: 'Validation failed', issues: error.issues });
     if (error instanceof PromotionConflictError) return reply.code(error.code === 'not_found' ? 404 : 409).send({ error: error.message, code: error.code });
+    if (error instanceof EnvironmentValidationError) return reply.code(400).send({ error: error.message });
+    if (error instanceof EnvironmentConfigurationError) return reply.code(503).send({ error: 'Environment variable encryption is unavailable' });
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return reply.code(400).send({ error: 'Repository path does not exist' });
     if (error instanceof Error && error.message.includes('WORKSPACE_ROOT')) return reply.code(400).send({ error: error.message });
     if ((error as { code?: string }).code?.startsWith('SQLITE_CONSTRAINT')) return reply.code(409).send({ error: 'Resource conflicts with existing data' });
@@ -188,6 +215,75 @@ export async function buildApp(options: AppOptions = {}): Promise<CommandCenterA
     return issueAccessToken(appSessionSecret, appTokenTtlSeconds, now());
   });
   const onboardingLocks = new Map<string, Promise<unknown>>();
+
+  const environmentName = (value: unknown): EnvironmentName => {
+    if (typeof value !== 'string' || !ENVIRONMENTS.includes(value as EnvironmentName)) throw new EnvironmentValidationError('Invalid environment');
+    return value as EnvironmentName;
+  };
+  const environmentService = () => {
+    if (!environmentVariables) throw new EnvironmentConfigurationError('Environment variable encryption is unavailable');
+    return environmentVariables;
+  };
+  const environmentScope = (request: { params: unknown }) => {
+    const params = request.params as { id?: string; repositoryId?: string; environment?: string };
+    const project = params.id ? store.getProject(params.id) : undefined;
+    if (!project) return undefined;
+    if (params.repositoryId && !project.repositories.some((repository) => repository.id === params.repositoryId)) return undefined;
+    return { projectId: project.id, repositoryId: params.repositoryId, environment: environmentName(params.environment) };
+  };
+  const variableInput = (body: unknown): { key: string; value: string; classification: 'secret' | 'public'; allowAgentAccess: boolean } => {
+    const input = body as Record<string, unknown> | null;
+    if (!input || typeof input.key !== 'string' || typeof input.value !== 'string' ||
+      (input.classification !== 'secret' && input.classification !== 'public') || typeof input.allowAgentAccess !== 'boolean') {
+      throw new EnvironmentValidationError('Invalid environment variable input');
+    }
+    return { key: input.key, value: input.value, classification: input.classification, allowAgentAccess: input.allowAgentAccess };
+  };
+
+  for (const base of ['/projects/:id/environments/:environment/variables', '/projects/:id/repositories/:repositoryId/environments/:environment/variables']) {
+    app.get(base, async (request, reply) => {
+      const scope = environmentScope(request); if (!scope) return reply.code(404).send({ error: 'Scope not found' });
+      const project = store.getProject(scope.projectId)!;
+      const repositories = scope.repositoryId ? project.repositories.filter((item) => item.id === scope.repositoryId) : project.repositories;
+      const suggested = new Set<string>();
+      for (const repository of repositories) {
+        try { for (const item of parseDotenv(readFileSync(resolve(repository.path, '.env.example'), 'utf8'))) suggested.add(item.key); }
+        catch { /* Suggestions are optional; missing or malformed examples never block management. */ }
+      }
+      const variables = environmentService().list(scope.projectId, scope.repositoryId, scope.environment);
+      const present = new Set(variables.map((item) => item.key));
+      return { variables, suggestions: [...suggested].filter((key) => !present.has(key)).sort() };
+    });
+    app.post(base, async (request, reply) => {
+      const scope = environmentScope(request); if (!scope) return reply.code(404).send({ error: 'Scope not found' });
+      return reply.code(201).send(environmentService().save({ ...scope, ...variableInput(request.body) }));
+    });
+    app.put(`${base}/:key`, async (request, reply) => {
+      const scope = environmentScope(request); if (!scope) return reply.code(404).send({ error: 'Scope not found' });
+      const key = (request.params as { key: string }).key; const input = variableInput(request.body);
+      if (input.key !== key) throw new EnvironmentValidationError('Variable name cannot be changed during replacement');
+      return environmentService().save({ ...scope, ...input }, true);
+    });
+    app.delete(`${base}/:key`, async (request, reply) => {
+      const scope = environmentScope(request); if (!scope) return reply.code(404).send({ error: 'Scope not found' });
+      const deleted = environmentService().delete(scope.projectId, scope.repositoryId, scope.environment, (request.params as { key: string }).key);
+      return deleted ? reply.code(204).send() : reply.code(404).send({ error: 'Variable not found' });
+    });
+    app.post(`${base}/import`, async (request, reply) => {
+      const scope = environmentScope(request); if (!scope) return reply.code(404).send({ error: 'Scope not found' });
+      const body = request.body as { content?: unknown; confirm?: unknown; classification?: unknown; allowAgentAccess?: unknown } | null;
+      if (!body || typeof body.content !== 'string') throw new EnvironmentValidationError('Dotenv content is required');
+      const entries = parseDotenv(body.content);
+      const existing = new Set(environmentService().list(scope.projectId, scope.repositoryId, scope.environment)
+        .filter((item) => item.scope === (scope.repositoryId ? 'repository' : 'project')).map((item) => item.key));
+      if (entries.some((entry) => existing.has(entry.key))) throw new EnvironmentValidationError('Import conflicts with an existing variable');
+      if (body.confirm !== true) return { variables: entries.map(({ key }) => ({ key })), count: entries.length };
+      const classification = body.classification === 'public' ? 'public' : 'secret';
+      const allowAgentAccess = body.allowAgentAccess === true;
+      const variables = entries.map((entry) => environmentService().save({ ...scope, ...entry, classification, allowAgentAccess }));
+      return reply.code(201).send({ variables, count: variables.length });
+    });
+  }
 
   app.post('/projects', async (request, reply) => {
     const input = createProjectSchema.parse(request.body);

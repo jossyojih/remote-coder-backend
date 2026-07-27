@@ -5,20 +5,31 @@ import type { AgentEventEmitter, Job, Repository } from './types.js';
 
 export type PreparedRepository = { repository: Repository; sourcePath: string; worktreePath: string; branch: string; remoteName: string; remoteUrl: string; targetBranch: string; baseCommitSha: string; gitCommonDir: string };
 
+export function redactEnvironmentSecrets<T>(value: T, environment: NodeJS.ProcessEnv): T {
+  const secrets = Object.values(environment).filter((item): item is string => typeof item === 'string' && item.length > 0).sort((a, b) => b.length - a.length);
+  const visit = (item: unknown): unknown => {
+    if (typeof item === 'string') return secrets.reduce((text, secret) => text.split(secret).join('[REDACTED]'), item);
+    if (Array.isArray(item)) return item.map(visit);
+    if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, nested]) => [key, visit(nested)]));
+    return item;
+  };
+  return visit(value) as T;
+}
+
 function safeName(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'repository';
 }
 
-export function childEnvironment(provider?: 'codex' | 'claude'): NodeJS.ProcessEnv {
+export function childEnvironment(provider?: 'codex' | 'claude', additions: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const common = ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL', 'SSL_CERT_FILE', 'SSL_CERT_DIR'];
   const providerKeys = provider === 'codex' ? ['CODEX_HOME'] : provider === 'claude' ? ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'AWS_REGION', 'AWS_DEFAULT_REGION', 'AWS_PROFILE', 'GOOGLE_APPLICATION_CREDENTIALS', 'CLOUD_ML_REGION', 'ANTHROPIC_VERTEX_PROJECT_ID'] : [];
   const allowed = [...common, ...providerKeys];
-  return Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]])) as NodeJS.ProcessEnv;
+  return { ...Object.fromEntries(allowed.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]])), ...additions } as NodeJS.ProcessEnv;
 }
 
-export function runCommand(command: string, args: string[], cwd?: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string }> {
+export function runCommand(command: string, args: string[], cwd?: string, timeoutMs?: number, environment: NodeJS.ProcessEnv = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env: childEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { cwd, env: childEnvironment(undefined, environment), stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = '';
     let timer: NodeJS.Timeout | undefined;
     let timedOut = false;

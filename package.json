@@ -8,6 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "generate:auth": "node --import tsx src/generate-auth-secrets.ts",
+    "generate:env-key": "node --import tsx src/generate-environment-key.ts",
     "start": "node dist/src/server.js",
     "test": "tsc -p tsconfig.test.json && NODE_ENV=test node --test .test-dist/test/**/*.test.js"
   },
